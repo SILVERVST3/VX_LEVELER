@@ -133,12 +133,13 @@ private:
 };
 
 //==============================================================================
-class VXDocumentController : public juce::ARADocumentControllerSpecialisation,
-                             private juce::Timer
+class VXDocumentController : public juce::ARADocumentControllerSpecialisation
 {
 public:
-    using juce::ARADocumentControllerSpecialisation::ARADocumentControllerSpecialisation;
-    ~VXDocumentController() override { stopTimer(); }
+    // construtor/destrutor explicitos (definidos no .cpp) - o MSVC falha com o construtor herdado
+    VXDocumentController (const ARA::PlugIn::PlugInEntry* entry,
+                          const ARA::ARADocumentControllerHostInstance* instance);
+    ~VXDocumentController() override;
 
     juce::ScopedTryReadLock getProcessingLock() { return juce::ScopedTryReadLock { processLock }; }
     juce::ARADocument* getDocumentPtr() const noexcept { return document; }
@@ -164,8 +165,9 @@ protected:
     void didEnableAudioSourceSamplesAccess (juce::ARAAudioSource* audioSource, bool enable) override;
 
 private:
-    void timerCallback() override;
+    friend class VXAnalysisScheduler;
     void scheduleAnalyses();
+    std::unique_ptr<juce::Timer> scheduler;   // timer fica no .cpp (pimpl)
 
     juce::ReadWriteLock processLock;
     juce::ARADocument* document = nullptr;

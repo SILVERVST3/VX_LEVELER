@@ -327,6 +327,28 @@ bool VXPlaybackRenderer::processBlock (AudioBuffer<float>& buffer,
 //==============================================================================
 //  Document controller
 //==============================================================================
+class VXAnalysisScheduler : public Timer
+{
+public:
+    explicit VXAnalysisScheduler (VXDocumentController& o) : owner (o) {}
+    ~VXAnalysisScheduler() override { stopTimer(); }
+    void timerCallback() override { owner.scheduleAnalyses(); }
+private:
+    VXDocumentController& owner;
+};
+
+VXDocumentController::VXDocumentController (const ARA::PlugIn::PlugInEntry* entry,
+                                            const ARA::ARADocumentControllerHostInstance* instance)
+    : ARADocumentControllerSpecialisation (entry, instance),
+      scheduler (std::make_unique<VXAnalysisScheduler> (*this))
+{
+}
+
+VXDocumentController::~VXDocumentController()
+{
+    scheduler.reset();
+}
+
 void VXDocumentController::willBeginEditing (ARADocument* doc)
 {
     processLock.enterWrite();
@@ -341,7 +363,7 @@ void VXDocumentController::didEndEditing (ARADocument* doc)
     processLock.exitWrite();
     ++modelVersion;
     scheduleAnalyses();
-    if (! isTimerRunning()) startTimer (300);
+    if (scheduler != nullptr && ! scheduler->isTimerRunning()) scheduler->startTimer (300);
 }
 
 ARAAudioSource* VXDocumentController::doCreateAudioSource (ARADocument* doc, ARA::ARAAudioSourceHostRef hostRef) noexcept
@@ -383,10 +405,6 @@ void VXDocumentController::scheduleAnalyses()
             vs->startAnalysisIfNeeded();
 }
 
-void VXDocumentController::timerCallback()
-{
-    scheduleAnalyses();
-}
 
 //------------------------------------------------------------------------------
 static constexpr int kArchiveMagic = 0x56584c31;   // "VXL1"
