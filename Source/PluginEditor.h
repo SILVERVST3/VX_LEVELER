@@ -73,6 +73,9 @@ private:
     void paintARA (juce::Graphics&, juce::Rectangle<int> area);
     void paintRealtime (juce::Graphics&, juce::Rectangle<int> area);
     void paintGrid (juce::Graphics&, juce::Rectangle<int> area, float scaleDb);
+public:
+    static juce::Colour regionColour (int type);
+private:
 
     juce::Rectangle<int> getPlotArea() const;
     float xForTime (double t) const;
@@ -114,10 +117,16 @@ public:
     void resized() override;
 
 private:
+    enum Section { gateSec = 0, dynSec, breathSec, sibSec, numSections };
+
     void timerCallback() override;
     void exportWav();
     void exportMidi();
     void updateEnablement();
+    void showSection (int index);
+    void addCombo (juce::ComboBox& box, const juce::StringArray& items, const char* paramID,
+                   std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment>& att,
+                   const juce::String& label, int section);
 
     VXProcessor& proc;
     SilverLookAndFeel lnf;
@@ -125,20 +134,34 @@ private:
 
     LevelerView view;
 
-    juce::ComboBox targetBox, floorBox;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAtt, floorAtt;
+    int currentSection = dynSec;
+    juce::TextButton tabs[numSections];
+    juce::TextButton power[numSections];
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> powerAtt[numSections];
+
+    juce::ComboBox targetBox, floorBox, gateModeBox, breathModeBox, sibModeBox;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> targetAtt, floorAtt, gateModeAtt, breathModeAtt, sibModeAtt;
+
     LabeledKnob speed, smoothing, catchPeaks, range, targetLevel, floorKnob, output;
+    LabeledKnob gateThresh, gateRed, gateMinLen, gateClose, gateOpen;
+    LabeledKnob breathRed, breathThresh, breathTrans;
+    LabeledKnob sibThresh, sibTrans, sibSpectral;
+
+    struct ComboRow { juce::ComboBox* box; juce::String label; int section; };
+    std::vector<ComboRow> comboRows;
+    std::vector<std::pair<juce::Component*, int>> sectionComps;
 
     juce::TextButton bypassButton { "Bypass" }, undoButton { "Undo" }, clearButton { "Clear Edits" },
-                     fitButton { "Fit" }, wavButton { "Export WAV" }, midiButton { "Export MIDI" };
+                     fitButton { "Fit" }, reanalyseButton { "Reanalisar" }, wavButton { "Export WAV" }, midiButton { "Export MIDI" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAtt;
 
     std::unique_ptr<juce::FileChooser> chooser;
 
-    juce::String statusText, modeText;
+    juce::String statusText, modeText, diagText;
     float inLufs = vx::kMinDb, outLufs = vx::kMinDb, floorVal = -40.0f, targetVal = -23.0f, gainNow = 0.0f;
+    int nGate = 0, nBreath = 0, nSib = 0;
 
-    juce::Rectangle<int> headerArea, sideArea, statsArea, toolbarArea;
+    juce::Rectangle<int> headerArea, sideArea, statsArea, toolbarArea, titleArea, descArea;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VXEditor)
 };

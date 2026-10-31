@@ -17,6 +17,28 @@ namespace ParamID
     static constexpr const char* target     = "target";
     static constexpr const char* output     = "output";
     static constexpr const char* bypass     = "bypass";
+
+    static constexpr const char* dynOn      = "dynOn";
+
+    static constexpr const char* gateOn     = "gateOn";
+    static constexpr const char* gateMode   = "gateMode";
+    static constexpr const char* gateThresh = "gateThresh";
+    static constexpr const char* gateClose  = "gateClose";
+    static constexpr const char* gateRed    = "gateReduction";
+    static constexpr const char* gateOpen   = "gateOpen";
+    static constexpr const char* gateMinLen = "gateMinLen";
+
+    static constexpr const char* breathOn     = "breathOn";
+    static constexpr const char* breathRed    = "breathReduction";
+    static constexpr const char* breathMode   = "breathThreshMode";
+    static constexpr const char* breathThresh = "breathThresh";
+    static constexpr const char* breathTrans  = "breathTransition";
+
+    static constexpr const char* sibOn       = "sibOn";
+    static constexpr const char* sibMode     = "sibThreshMode";
+    static constexpr const char* sibThresh   = "sibThresh";
+    static constexpr const char* sibTrans    = "sibTransition";
+    static constexpr const char* sibSpectral = "sibSpectral";
 }
 
 //==============================================================================
@@ -67,6 +89,16 @@ public:
 
     VXPlaybackRenderer* getRenderer() const noexcept { return getPlaybackRenderer<VXPlaybackRenderer>(); }
 
+    /** document controller ARA (via renderer ou editor view) - nullptr sem ARA */
+    VXDocumentController* getDocController() const noexcept
+    {
+        ARA::PlugIn::DocumentController* dc = nullptr;
+        if (auto* r = getPlaybackRenderer()) dc = r->getDocumentController();
+        else if (auto* v = getEditorView())  dc = v->getDocumentController();
+        else if (auto* e = getEditorRenderer()) dc = e->getDocumentController();
+        return dc != nullptr ? juce::ARADocumentControllerSpecialisation::getSpecialisedDocumentController<VXDocumentController> (dc) : nullptr;
+    }
+
     vx::RealtimeLeveler& getRealtime() noexcept { return realtime; }
 
     std::atomic<double> playheadSeconds { 0.0 };
@@ -81,6 +113,7 @@ private:
         const juce::ARAAudioSource* source = nullptr;
         int analysisVersion = -1;
         int editsVersion = -1;
+        int regionsVersion = -1;
         vx::Settings settings;
         std::shared_ptr<const vx::GainCurve> base, full;
     };
@@ -100,6 +133,9 @@ private:
     std::atomic<float>* pTarget = nullptr;
     std::atomic<float>* pOutput = nullptr;
     std::atomic<float>* pBypass = nullptr;
+
+    std::map<juce::String, std::atomic<float>*> raw;
+    float pv (const char* id) const { auto it = raw.find (id); return it != raw.end() ? it->second->load() : 0.0f; }
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VXProcessor)
 };

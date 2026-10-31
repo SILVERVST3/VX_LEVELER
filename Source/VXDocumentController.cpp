@@ -138,7 +138,10 @@ VXAudioModification::VXAudioModification (ARAAudioSource* audioSource,
     : ARAAudioModification (audioSource, hostRef, clone)
 {
     if (auto* c = dynamic_cast<const VXAudioModification*> (clone))
+    {
         editsDb = c->editsDb;
+        disabledRegions = c->disabledRegions;
+    }
 }
 
 void VXAudioModification::notifyEdited()
@@ -180,8 +183,13 @@ void VXPlaybackRenderer::prepareToPlay (double sr, int maxBlockIn, int numChanne
     const bool buffered = alwaysNonRealtime == AlwaysNonRealtime::no;
     bool mismatch = false;
 
+    deEssers.clear();
     for (auto* region : getPlaybackRegions())
     {
+        auto& d = deEssers[region];
+        d.filter.prepare (sampleRate, numChannels);
+        d.expectedSource = -1;
+
         auto* source = region->getAudioModification()->getAudioSource();
         if (! approximatelyEqual (source->getSampleRate(), sampleRate)) mismatch = true;
 
@@ -209,6 +217,7 @@ void VXPlaybackRenderer::prepareToPlay (double sr, int maxBlockIn, int numChanne
 void VXPlaybackRenderer::releaseResources()
 {
     readers.clear();
+    deEssers.clear();
     tempBuffer.reset();
     ARAPlaybackRenderer::releaseResources();
 }
@@ -295,6 +304,20 @@ bool VXPlaybackRenderer::processBlock (AudioBuffer<float>& buffer,
 
         // posicao na fonte -> amostras da curva (mesma taxa da fonte)
         const double srcScale = curve != nullptr ? curve->sampleRate / sampleRate : 1.0;
+
+        // parte espectral do de-esser
+        if (curve != nullptr && curve->hasSpectral)
+        {
+            auto di = deEssers.find (region);
+            if (di != deEssers.end())
+            {
+                auto& d = di->second;
+                if (d.expectedSource != startInSource) d.filter.reset();
+                d.filter.process (tempBuffer->getArrayOfWritePointers(), nch, startInBuffer, n,
+                                  *curve, (double) startInSource * srcScale, srcScale);
+                d.expectedSource = startInSource + n;
+            }
+        }
 
         for (int c = 0; c < nch; ++c)
         {
@@ -406,6 +429,38 @@ void VXDocumentController::scheduleAnalyses()
 }
 
 
+void VXDocumentController::reanalyseAll()
+{
+    if (document == nullptr || isEditing) return;
+    for (auto* s : document->getAudioSources())
+        if (auto* vs = dynamic_cast<VXAudioSource*> (s))
+            vs->invalidateAnalysis();
+    scheduleAnalyses();
+}
+
+String VXDocumentController::getDiagnostics() const
+{
+    if (document == nullptr)
+        return "documento ARA ainda nao recebido do host";
+
+    int total = 0, access = 0, ready = 0, running = 0, failedCount = 0;
+    for (auto* s : document->getAudioSources())
+    {
+        ++total;
+        if (s->isSampleAccessEnabled()) ++access;
+        if (auto* vs = dynamic_cast<VXAudioSource*> (s))
+        {
+            const auto st = vs->getState();
+            if (st == VXAudioSource::ready) ++ready;
+            else if (st == VXAudioSource::analysing) ++running;
+            else if (st == VXAudioSource::failed) ++failedCount;
+        }
+    }
+    return "fontes: " + String (total) + " | acesso: " + String (access)
+         + " | analisadas: " + String (ready) + " | analisando: " + String (running)
+         + " | falhas: " + String (failedCount);
+}
+
 //------------------------------------------------------------------------------
 static constexpr int kArchiveMagic = 0x56584c31;   // "VXL1"
 
@@ -414,7 +469,7 @@ bool VXDocumentController::doStoreObjectsToStream (ARAOutputStream& output, cons
     const auto& mods = filter->getAudioModificationsToStore<VXAudioModification>();
 
     if (! output.writeInt (kArchiveMagic)) return false;
-    if (! output.writeInt (1)) return false;   // versao
+    if (! output.writeInt (2)) return false;   // versao
     if (! output.writeInt64 ((int64) mods.size())) return false;
 
     for (size_t i = 0; i < mods.size(); ++i)
@@ -427,6 +482,10 @@ bool VXDocumentController::doStoreObjectsToStream (ARAOutputStream& output, cons
         if (! output.writeInt (n)) return false;
         if (n > 0 && ! output.write (m->editsDb.data(), (size_t) n * sizeof (float))) return false;
 
+        if (! output.writeInt ((int) m->disabledRegions.size())) return false;
+        for (auto& k : m->disabledRegions)
+            if (! output.writeInt (k.type) || ! output.writeInt (k.startFrame)) return false;
+
         getDocumentController()->getHostArchivingController()->notifyDocumentArchivingProgress ((float) i / (float) jmax<size_t> (1, mods.size()));
     }
     getDocumentController()->getHostArchivingController()->notifyDocumentArchivingProgress (1.0f);
@@ -437,7 +496,6 @@ bool VXDocumentController::doRestoreObjectsFromStream (ARAInputStream& input, co
 {
     if (input.readInt() != kArchiveMagic) return ! input.failed();
     const int version = input.readInt();
-    ignoreUnused (version);
     const auto count = input.readInt64();
 
     for (int64 i = 0; i < count && ! input.failed(); ++i)
@@ -452,10 +510,25 @@ bool VXDocumentController::doRestoreObjectsFromStream (ARAInputStream& input, co
                 return false;
         }
 
+        std::vector<vx::RegionKey> disabledKeys;
+        if (version >= 2)
+        {
+            const int nk = input.readInt();
+            for (int k = 0; k < nk && k < 1000000 && ! input.failed(); ++k)
+            {
+                vx::RegionKey key;
+                key.type = input.readInt();
+                key.startFrame = input.readInt();
+                disabledKeys.push_back (key);
+            }
+        }
+
         if (auto* m = filter->getAudioModificationToRestoreStateWithID<VXAudioModification> (persistentID.getCharPointer()))
         {
             m->editsDb = std::move (edits);
+            m->disabledRegions = std::move (disabledKeys);
             ++m->editsVersion;
+            ++m->regionsVersion;
             m->notifyContentChanged (ARAContentUpdateScopes::samplesAreAffected(), false);
         }
         getDocumentController()->getHostArchivingController()->notifyDocumentUnarchivingProgress ((float) i / (float) jmax<int64> (1, count));

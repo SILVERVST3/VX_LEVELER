@@ -129,6 +129,16 @@ void LevelerView::timerCallback()
     if (need) repaint();
 }
 
+Colour LevelerView::regionColour (int type)
+{
+    switch (type)
+    {
+        case 0:  return Colour (0xff6f7c8f);   // pausa (gate)
+        case 1:  return Colour (0xff2f8f8a);   // respiro
+        default: return Colour (0xff7a5ba6);   // sibilante
+    }
+}
+
 void LevelerView::paintGrid (Graphics& g, Rectangle<int> area, float scaleDb)
 {
     const auto a = area.toFloat();
@@ -291,6 +301,43 @@ void LevelerView::paintARA (Graphics& g, Rectangle<int> plot)
         g.setColour (Silver::waveProc.withAlpha (0.9f));
         g.fillRectList (procBars);
 
+        // regioes detectadas (pausas / respiros / sibilantes)
+        if (curve != nullptr)
+        {
+            const auto strip = Rectangle<float> (pf.getX(), pf.getBottom() - 15.0f, pf.getWidth(), 14.0f);
+            for (auto& r : curve->regions)
+            {
+                const double t0 = r.startFrame * (double) hop / fs - lane.modStart + lane.playStart;
+                const double t1 = r.endFrame   * (double) hop / fs - lane.modStart + lane.playStart;
+                const float rx0 = jmax (x0, xForTime (t0)), rx1 = jmin (x1, xForTime (t1));
+                if (rx1 < pf.getX() || rx0 > pf.getRight() || rx1 - rx0 < 0.5f) continue;
+
+                const auto col = regionColour ((int) r.type);
+                const auto band = Rectangle<float> (rx0, pf.getY(), jmax (1.0f, rx1 - rx0), pf.getHeight() - 16.0f);
+                const auto tag  = Rectangle<float> (rx0, strip.getY(), jmax (2.0f, rx1 - rx0), strip.getHeight());
+                if (r.enabled)
+                {
+                    g.setColour (col.withAlpha (0.10f));
+                    g.fillRect (band);
+                    g.setColour (col.withAlpha (0.85f));
+                    g.fillRoundedRectangle (tag, 3.0f);
+                }
+                else
+                {
+                    g.setColour (col.withAlpha (0.7f));
+                    g.drawRoundedRectangle (tag.reduced (0.5f), 3.0f, 1.0f);
+                }
+                if (tag.getWidth() > 34.0f)
+                {
+                    g.setColour (r.enabled ? Colours::white : col);
+                    g.setFont (FontOptions (10.0f, Font::bold));
+                    const String txt = r.type == vx::RegionType::gate ? "PAUSA" : r.type == vx::RegionType::breath ? "RESP" : "S";
+                    g.drawText (txt + " " + (r.depthDb <= vx::kInfDb + 0.1f ? String ("-inf") : String (roundToInt (r.depthDb))),
+                                tag.toNearestInt(), Justification::centred, false);
+                }
+            }
+        }
+
         if (started)
         {
             g.setColour (Silver::contrast.withAlpha (0.45f));
@@ -312,6 +359,22 @@ void LevelerView::paintARA (Graphics& g, Rectangle<int> plot)
         g.setColour (Silver::navy);
         g.setFont (FontOptions (12.0f, Font::bold));
         g.drawText (lane.name, box.reduced (6.0f, 4.0f).toNearestInt(), Justification::topLeft, true);
+    }
+
+    // legenda das regioes
+    {
+        const char* names[3] = { "pausa", "respiro", "sibilante" };
+        float lx = pf.getRight() - 230.0f;
+        const float ly = pf.getY() + 6.0f;
+        g.setFont (FontOptions (11.0f, Font::bold));
+        for (int t = 0; t < 3; ++t)
+        {
+            g.setColour (regionColour (t).withAlpha (0.85f));
+            g.fillRoundedRectangle (lx, ly + 2.0f, 10.0f, 10.0f, 2.0f);
+            g.setColour (Silver::steel);
+            g.drawText (names[t], (int) lx + 14, (int) ly, 70, 14, Justification::centredLeft);
+            lx += t == 0 ? 60.0f : 70.0f;
+        }
     }
 
     // pincel de edicao
@@ -406,6 +469,35 @@ void LevelerView::mouseDown (const MouseEvent& e)
 {
     if (! proc.isBoundToARA() || ! getPlotArea().contains (e.getPosition()) || e.mods.isPopupMenu())
         return;
+
+    // clique na faixa de regioes: liga/desliga a regiao
+    if ((float) e.y >= (float) getPlotArea().getBottom() - 16.0f)
+    {
+        const double t = timeForX ((float) e.x);
+        for (auto& l : getLanes())
+        {
+            if (t < l.playStart || t >= l.playEnd) continue;
+            auto curve = proc.getCurveFor (l.mod);
+            auto analysis = l.source->getAnalysis();
+            if (curve == nullptr || analysis == nullptr) continue;
+            const double srcT = t - l.playStart + l.modStart;
+            const int f = (int) (srcT * analysis->sampleRate / analysis->hopSamples);
+            const vx::Region* hit = nullptr;
+            for (auto& r : curve->regions)
+                if (f >= r.startFrame - 2 && f < r.endFrame + 2 && (hit == nullptr || r.type == vx::RegionType::sibilance))
+                    hit = &r;
+            if (hit != nullptr)
+            {
+                l.mod->toggleRegion (hit->type, hit->startFrame);
+                l.mod->notifyEdited();
+                proc.refreshCurves();
+                if (onEditsChanged) onEditsChanged();
+                repaint();
+            }
+            return;
+        }
+        return;
+    }
 
     autoFit = false;
     dragging = true;
@@ -591,12 +683,15 @@ public:
 
             const int chunk = 1 << 15;
             AudioBuffer<float> buf (nch, chunk);
+            vx::SpectralDeEsser deEsser;
+            deEsser.prepare (rd.sampleRate, nch);
             for (int64 pos = 0; pos < rd.lengthInSamples; pos += chunk)
             {
                 if (threadShouldExit()) return;
                 const int n = (int) jmin<int64> (chunk, rd.lengthInSamples - pos);
                 buf.clear();
                 if (! rd.read (&buf, 0, n, pos, true, nch > 1)) { errors << it.file.getFileName() << " (leitura)\n"; break; }
+                deEsser.process (buf.getArrayOfWritePointers(), nch, 0, n, *it.curve, (double) pos, 1.0);
                 for (int c = 0; c < nch; ++c)
                 {
                     auto* d = buf.getWritePointer (c);
@@ -636,57 +731,107 @@ VXEditor::VXEditor (VXProcessor& p)
       AudioProcessorEditorARAExtension (&p),
       proc (p),
       view (p),
-      speed       (p.apvts, ParamID::speed,      "Speed"),
-      smoothing   (p.apvts, ParamID::smoothing,  "Smoothing"),
-      catchPeaks  (p.apvts, ParamID::catchPeaks, "Catch Peaks"),
-      range       (p.apvts, ParamID::range,      "Range"),
-      targetLevel (p.apvts, ParamID::target,     "Target"),
-      floorKnob   (p.apvts, ParamID::floorDb,    "Noisefloor"),
-      output      (p.apvts, ParamID::output,     "Output")
+      speed        (p.apvts, ParamID::speed,        "Speed"),
+      smoothing    (p.apvts, ParamID::smoothing,    "Smoothing"),
+      catchPeaks   (p.apvts, ParamID::catchPeaks,   "Catch Peaks"),
+      range        (p.apvts, ParamID::range,        "Range"),
+      targetLevel  (p.apvts, ParamID::target,       "Target"),
+      floorKnob    (p.apvts, ParamID::floorDb,      "Noisefloor"),
+      output       (p.apvts, ParamID::output,       "Output"),
+      gateThresh   (p.apvts, ParamID::gateThresh,   "Threshold"),
+      gateRed      (p.apvts, ParamID::gateRed,      "Reduction"),
+      gateMinLen   (p.apvts, ParamID::gateMinLen,   "Min Length"),
+      gateClose    (p.apvts, ParamID::gateClose,    "Close Speed"),
+      gateOpen     (p.apvts, ParamID::gateOpen,     "Open Speed"),
+      breathRed    (p.apvts, ParamID::breathRed,    "Reduction"),
+      breathThresh (p.apvts, ParamID::breathThresh, "Threshold"),
+      breathTrans  (p.apvts, ParamID::breathTrans,  "Transition"),
+      sibThresh    (p.apvts, ParamID::sibThresh,    "Threshold"),
+      sibTrans     (p.apvts, ParamID::sibTrans,     "Transition"),
+      sibSpectral  (p.apvts, ParamID::sibSpectral,  "Spectral")
 {
     setLookAndFeel (&lnf);
 
     addAndMakeVisible (view);
     view.onEditsChanged = [this] { updateEnablement(); };
 
-    targetBox.addItemList ({ "LUFS-I Match", "LUFS-I Custom", "LUFS-S Match", "LUFS-S Custom" }, 1);
-    floorBox.addItemList ({ "Auto", "Custom" }, 1);
-    addAndMakeVisible (targetBox);
-    addAndMakeVisible (floorBox);
-    targetAtt = std::make_unique<AudioProcessorValueTreeState::ComboBoxAttachment> (p.apvts, ParamID::targetMode, targetBox);
-    floorAtt  = std::make_unique<AudioProcessorValueTreeState::ComboBoxAttachment> (p.apvts, ParamID::floorMode, floorBox);
+    // ---- abas das secoes
+    const char* tabNames[numSections]  = { "GATE", "DYNAMICS", "BREATH", "SIBILANCE" };
+    const char* powerIDs[numSections]  = { ParamID::gateOn, ParamID::dynOn, ParamID::breathOn, ParamID::sibOn };
+    for (int i = 0; i < numSections; ++i)
+    {
+        tabs[i].setButtonText (tabNames[i]);
+        tabs[i].setClickingTogglesState (true);
+        tabs[i].setRadioGroupId (4711);
+        tabs[i].onClick = [this, i] { showSection (i); };
+        addAndMakeVisible (tabs[i]);
+
+        power[i].setClickingTogglesState (true);
+        power[i].setTooltip ("Liga/desliga esta secao");
+        powerAtt[i] = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, powerIDs[i], power[i]);
+        addChildComponent (power[i]);
+    }
+
+    // ---- combos
+    addCombo (targetBox,     { "LUFS-I Match", "LUFS-I Custom", "LUFS-S Match", "LUFS-S Custom" }, ParamID::targetMode, targetAtt, "TARGET", dynSec);
+    addCombo (floorBox,      { "Auto", "Custom" }, ParamID::floorMode,  floorAtt,      "NOISEFLOOR", dynSec);
+    addCombo (gateModeBox,   { "Vocal Detection", "Threshold Based" }, ParamID::gateMode, gateModeAtt, "MODE", gateSec);
+    addCombo (breathModeBox, { "Auto", "Custom" }, ParamID::breathMode, breathModeAtt, "THRESHOLD", breathSec);
+    addCombo (sibModeBox,    { "Auto", "Custom" }, ParamID::sibMode,    sibModeAtt,    "THRESHOLD", sibSec);
     targetBox.setTooltip ("Match: mantem a loudness original (integrada ou short-term). Custom: define o alvo em LUFS.");
     floorBox.setTooltip ("Audio abaixo do noisefloor (pausas, respiros, ruido de sala) nao e levantado.");
+    gateModeBox.setTooltip ("Vocal Detection: detecta a voz sozinho. Threshold Based: usa o knob Threshold.");
 
-    for (auto* k : { &speed, &smoothing, &catchPeaks, &range, &targetLevel, &floorKnob, &output })
-        addAndMakeVisible (*k);
+    // ---- knobs por secao
+    for (auto* k : { &speed, &smoothing, &catchPeaks, &range, &targetLevel, &floorKnob })   sectionComps.push_back ({ k, dynSec });
+    for (auto* k : { &gateThresh, &gateRed, &gateMinLen, &gateClose, &gateOpen })           sectionComps.push_back ({ k, gateSec });
+    for (auto* k : { &breathRed, &breathThresh, &breathTrans })                              sectionComps.push_back ({ k, breathSec });
+    for (auto* k : { &sibThresh, &sibTrans, &sibSpectral })                                  sectionComps.push_back ({ k, sibSec });
+    for (auto& c : sectionComps) addChildComponent (*c.first);
+    addAndMakeVisible (output);
 
-    speed.slider.setTooltip ("Velocidade de reacao do nivelamento (janela de analise). Fala: mais rapido. Canto: mais lento.");
+    speed.slider.setTooltip ("Velocidade de reacao do nivelamento. Fala: mais rapido. Canto: mais lento.");
     smoothing.slider.setTooltip ("Suaviza a curva de ganho para as mudancas ficarem inaudiveis.");
     catchPeaks.slider.setTooltip ("Reducao extra em picos rapidos que o nivelamento suave nao pega.");
     range.slider.setTooltip ("Maximo de ganho/atenuacao automaticos.");
     output.slider.setTooltip ("Ganho de saida.");
+    gateThresh.slider.setTooltip ("So no modo Threshold Based: abaixo deste nivel e pausa.");
+    gateRed.slider.setTooltip ("Quanto as pausas sao abaixadas (-inf = silencio).");
+    gateMinLen.slider.setTooltip ("Pausas mais curtas que isto nao sao tocadas.");
+    gateClose.slider.setTooltip ("Fade de entrada da pausa (acontece dentro da pausa, nao na voz).");
+    gateOpen.slider.setTooltip ("Fade de saida da pausa, antes da voz voltar.");
+    breathRed.slider.setTooltip ("Reducao fixa de cada respiro.");
+    breathThresh.slider.setTooltip ("Respiros mais altos que isto sao reduzidos tambem pelo excesso (modo Custom).");
+    breathTrans.slider.setTooltip ("Duracao das transicoes da reducao.");
+    sibThresh.slider.setTooltip ("Sibilantes acima deste nivel sao reduzidos (modo Custom).");
+    sibTrans.slider.setTooltip ("Duracao das transicoes ao redor de cada sibilante.");
+    sibSpectral.slider.setTooltip ("Parte espectral: corta so as frequencias mais agudas do S. 0% = so reducao de nivel.");
 
-    for (auto* b : { &bypassButton, &undoButton, &clearButton, &fitButton, &wavButton, &midiButton })
+    // ---- barra de ferramentas
+    for (auto* b : { &bypassButton, &undoButton, &clearButton, &fitButton, &reanalyseButton, &wavButton, &midiButton })
         addAndMakeVisible (*b);
 
     bypassButton.setClickingTogglesState (true);
     bypassAtt = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, ParamID::bypass, bypassButton);
-    undoButton.onClick  = [this] { view.undo(); };
-    clearButton.onClick = [this] { view.clearEdits(); };
-    fitButton.onClick   = [this] { view.fitView(); };
-    wavButton.onClick   = [this] { exportWav(); };
-    midiButton.onClick  = [this] { exportMidi(); };
+    undoButton.onClick      = [this] { view.undo(); };
+    clearButton.onClick     = [this] { view.clearEdits(); };
+    fitButton.onClick       = [this] { view.fitView(); };
+    reanalyseButton.onClick = [this] { if (auto* dc = proc.getDocController()) dc->reanalyseAll(); };
+    wavButton.onClick       = [this] { exportWav(); };
+    midiButton.onClick      = [this] { exportMidi(); };
     undoButton.setTooltip ("Desfaz a ultima edicao manual");
     clearButton.setTooltip ("Remove todas as edicoes manuais dos clipes (os ajustes continuam)");
+    reanalyseButton.setTooltip ("Descarta a analise e le o audio de novo");
     wavButton.setTooltip ("Exporta a voz processada (WAV 24 bits) de cada clipe");
     midiButton.setTooltip ("Exporta a automacao de volume como MIDI CC7 (-15 dB = 0, 0 dB = 63, +15 dB = 127)");
 
     // ARA exige editor redimensionavel
     setResizable (true, true);
-    setResizeLimits (900, 540, 2600, 1600);
-    setSize (1100, 660);
+    setResizeLimits (980, 660, 2600, 1600);
+    setSize (1120, 720);
 
+    tabs[dynSec].setToggleState (true, dontSendNotification);
+    showSection (dynSec);
     updateEnablement();
     timerCallback();
     startTimerHz (10);
@@ -698,16 +843,47 @@ VXEditor::~VXEditor()
     setLookAndFeel (nullptr);
 }
 
+void VXEditor::addCombo (ComboBox& box, const StringArray& items, const char* paramID,
+                         std::unique_ptr<AudioProcessorValueTreeState::ComboBoxAttachment>& att,
+                         const String& label, int section)
+{
+    box.addItemList (items, 1);
+    addChildComponent (box);
+    att = std::make_unique<AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, paramID, box);
+    comboRows.push_back ({ &box, label, section });
+    sectionComps.push_back ({ &box, section });
+}
+
+void VXEditor::showSection (int index)
+{
+    currentSection = index;
+    for (auto& c : sectionComps) c.first->setVisible (c.second == index);
+    for (int i = 0; i < numSections; ++i) power[i].setVisible (i == index);
+    resized();
+    repaint();
+}
+
 void VXEditor::updateEnablement()
 {
-    const int tm = targetBox.getSelectedItemIndex();
-    targetLevel.setEnabled (tm == 1 || tm == 3);
+    targetLevel.setEnabled (targetBox.getSelectedItemIndex() == 1 || targetBox.getSelectedItemIndex() == 3);
     floorKnob.setEnabled (floorBox.getSelectedItemIndex() == 1);
+    gateThresh.setEnabled (gateModeBox.getSelectedItemIndex() == 1);
+    breathThresh.setEnabled (breathModeBox.getSelectedItemIndex() == 1);
+    sibThresh.setEnabled (sibModeBox.getSelectedItemIndex() == 1);
+
+    // aba com secao desligada fica com texto apagado
+    for (int i = 0; i < numSections; ++i)
+    {
+        const bool on = power[i].getToggleState();
+        power[i].setButtonText (on ? "ON" : "OFF");
+        tabs[i].setColour (TextButton::textColourOffId, on ? Silver::navy : Silver::steel.withAlpha (0.6f));
+    }
 
     const bool ara = proc.isBoundToARA();
     undoButton.setEnabled (ara && view.canUndo());
     clearButton.setEnabled (ara);
     fitButton.setEnabled (ara);
+    reanalyseButton.setEnabled (ara);
     wavButton.setEnabled (ara);
     midiButton.setEnabled (ara);
 }
@@ -719,15 +895,39 @@ void VXEditor::timerCallback()
     const bool ara = proc.isBoundToARA();
     modeText = ara ? "ARA 2" : "REALTIME";
 
+    if (auto* dc = proc.getDocController())
+    {
+        dc->scheduleAnalyses();
+        const int regions = proc.getRenderer() != nullptr ? (int) proc.getRenderer()->getPlaybackRegions().size() : 0;
+        diagText = "renderer: " + String (proc.getRenderer() != nullptr ? "sim" : "nao")
+                 + " | clipes: " + String (regions) + " | " + dc->getDiagnostics();
+    }
+    else
+    {
+        diagText = ara ? "ARA ligado, mas sem document controller"
+                       : "ARA NAO ativo - ver Preferences > Plug-ins > ARA";
+    }
+
     if (ara)
     {
+        nGate = nBreath = nSib = 0;
         if (auto c = view.getFocusCurve())
         {
             inLufs = c->inputLufsI; outLufs = c->outputLufsI; floorVal = c->floorDb; targetVal = c->targetDb;
-            gainNow = c->gainDbAtTime (proc.playheadSeconds.load());   // aproximado (tempo de projeto)
+            gainNow = c->gainDbAtTime (proc.playheadSeconds.load());
             if (auto* r = proc.getRenderer(); r != nullptr && proc.playing.load())
                 gainNow = r->currentGainDb.load();
         }
+        for (auto& l : view.getLanes())
+            if (auto c = proc.getCurveFor (l.mod))
+                for (auto& r : c->regions)
+                    if (r.enabled)
+                    {
+                        if (r.type == vx::RegionType::gate) ++nGate;
+                        else if (r.type == vx::RegionType::breath) ++nBreath;
+                        else ++nSib;
+                    }
+
         int analysing = 0;
         for (auto& l : view.getLanes()) if (l.source->getState() == VXAudioSource::analysing) ++analysing;
         statusText = analysing > 0 ? "Analisando " + String (analysing) + " clipe(s)..." : String();
@@ -740,10 +940,11 @@ void VXEditor::timerCallback()
         inLufs = rt.getInputShortLufs(); outLufs = rt.getInputShortLufs() + proc.realtimeGainDb.load();
         targetVal = rt.getTargetDb();
         gainNow = proc.realtimeGainDb.load();
-        statusText = "Sem ARA: nivelamento em tempo real";
+        statusText = "Sem ARA: so o Dynamics funciona (tempo real)";
     }
     repaint (headerArea);
     repaint (statsArea);
+    repaint (getLocalBounds().removeFromBottom (20));
 }
 
 void VXEditor::paint (Graphics& g)
@@ -773,7 +974,6 @@ void VXEditor::paint (Graphics& g)
         g.setFont (FontOptions (12.0f));
         g.drawText ("vocal leveler", t.withTrimmedLeft (w1 + 100).withTrimmedTop (6), Justification::centredLeft);
 
-        // selo do modo
         auto pill = Rectangle<float> ((float) headerArea.getRight() - 120.0f, h.getCentreY() - 12.0f, 100.0f, 24.0f);
         g.setColour (modeText == "ARA 2" ? Silver::navyMid : Silver::steel);
         g.fillRoundedRectangle (pill, 12.0f);
@@ -789,17 +989,30 @@ void VXEditor::paint (Graphics& g)
     // painel lateral
     SilverLookAndFeel::drawMetalPanel (g, sideArea.toFloat());
     {
-        auto s = sideArea.reduced (14, 10);
+        const char* titles[numSections] = { "GATE", "DYNAMICS", "BREATH", "SIBILANCE" };
         g.setColour (Silver::navy);
         g.setFont (FontOptions (15.0f, Font::bold));
-        g.drawText ("DYNAMICS", s.removeFromTop (20), Justification::centredLeft);
+        g.drawText (titles[currentSection], titleArea, Justification::centredLeft);
         g.setColour (Silver::border);
-        g.drawHorizontalLine (sideArea.getY() + 34, (float) sideArea.getX() + 14.0f, (float) sideArea.getRight() - 14.0f);
+        g.drawHorizontalLine (titleArea.getBottom() + 3, (float) titleArea.getX(), (float) titleArea.getRight());
 
         g.setColour (Silver::navy);
         g.setFont (FontOptions (12.5f, Font::bold));
-        g.drawText ("TARGET", targetBox.getBounds().withX (sideArea.getX() + 14).withWidth (90), Justification::centredLeft);
-        g.drawText ("NOISEFLOOR", floorBox.getBounds().withX (sideArea.getX() + 14).withWidth (90), Justification::centredLeft);
+        for (auto& row : comboRows)
+            if (row.section == currentSection)
+                g.drawText (row.label, row.box->getBounds().withX (sideArea.getX() + 14).withWidth (96), Justification::centredLeft);
+
+        const char* desc[numSections] = {
+            "Abaixa as pausas entre as frases. Os fades acontecem dentro da pausa, nunca na voz.",
+            "Nivela a voz olhando o take inteiro. Abaixo do noisefloor nada e levantado.",
+            "Cada respiro e abaixado pelo valor fixo; os mais altos que o threshold, tambem pelo excesso.",
+            "De-esser: reduz o nivel dos S, X e T e corta as frequencias mais agudas de cada um." };
+        if (! descArea.isEmpty())
+        {
+            g.setColour (Silver::steel);
+            g.setFont (FontOptions (12.0f));
+            g.drawFittedText (desc[currentSection], descArea, Justification::topLeft, 4);
+        }
     }
 
     // estatisticas
@@ -815,12 +1028,13 @@ void VXEditor::paint (Graphics& g)
         const std::pair<String, String> rows[] = {
             { ara ? "Entrada LUFS-I" : "Entrada LUFS-S", fmt (inLufs, "") },
             { ara ? "Saida LUFS-I"   : "Saida LUFS-S",   fmt (outLufs, "") },
-            { "Alvo",            fmt (targetVal, "LUFS") },
-            { "Noisefloor",      ara ? fmt (floorVal, "dB") : String ("auto") },
-            { "Ganho agora",     (gainNow > 0 ? "+" : "") + String (gainNow, 1) + " dB" } };
+            { "Alvo",                fmt (targetVal, "LUFS") },
+            { "Noisefloor",          ara ? fmt (floorVal, "dB") : String ("auto") },
+            { "Pausas / Resp. / S",  ara ? String (nGate) + " / " + String (nBreath) + " / " + String (nSib) : String ("--") },
+            { "Ganho agora",         (gainNow > 0 ? "+" : "") + String (gainNow, 1) + " dB" } };
 
-        auto rr = statsArea.reduced (10, 6);
-        const int rh = rr.getHeight() / 5;
+        auto rr = statsArea.reduced (10, 5);
+        const int rh = rr.getHeight() / 6;
         for (auto& row : rows)
         {
             auto line = rr.removeFromTop (rh);
@@ -833,12 +1047,14 @@ void VXEditor::paint (Graphics& g)
         }
     }
 
-    // dica
+    // rodape: dicas + diagnostico
     g.setColour (Silver::steel);
     g.setFont (FontOptions (11.5f));
     auto hint = getLocalBounds().removeFromBottom (20).withTrimmedLeft (sideArea.getRight() + 10).withTrimmedRight (12);
-    g.drawText ("Arraste para cima/baixo: edita o ganho (Shift = fino)  |  Shift+roda: largura do pincel  |  Ctrl+roda: zoom  |  roda: rolar  |  duplo clique: ajustar",
-                hint, Justification::centredLeft, true);
+    g.drawText ("Arraste: ganho  |  Shift+roda: pincel  |  Ctrl+roda: zoom  |  clique na faixa: liga/desliga regiao",
+                hint.removeFromLeft (hint.getWidth() / 2), Justification::centredLeft, true);
+    g.setColour (diagText.startsWith ("ARA NAO") ? Silver::contrast : Silver::navyMid);
+    g.drawText (diagText, hint, Justification::centredRight, true);
 }
 
 void VXEditor::resized()
@@ -848,51 +1064,78 @@ void VXEditor::resized()
     r.removeFromBottom (20);
     r.reduce (10, 10);
 
-    sideArea = r.removeFromLeft (290);
+    sideArea = r.removeFromLeft (300);
     r.removeFromLeft (10);
 
     // barra de ferramentas
     toolbarArea = r.removeFromTop (32);
     {
         auto t = toolbarArea;
-        const int bw = 104;
+        const int bw = 100;
         bypassButton.setBounds (t.removeFromLeft (bw).reduced (2));
-        t.removeFromLeft (12);
-        undoButton.setBounds (t.removeFromLeft (bw - 20).reduced (2));
+        t.removeFromLeft (10);
+        undoButton.setBounds (t.removeFromLeft (70).reduced (2));
         clearButton.setBounds (t.removeFromLeft (bw).reduced (2));
-        fitButton.setBounds (t.removeFromLeft (60).reduced (2));
-        midiButton.setBounds (t.removeFromRight (bw + 6).reduced (2));
-        wavButton.setBounds (t.removeFromRight (bw + 6).reduced (2));
+        fitButton.setBounds (t.removeFromLeft (52).reduced (2));
+        reanalyseButton.setBounds (t.removeFromLeft (bw).reduced (2));
+        midiButton.setBounds (t.removeFromRight (bw + 4).reduced (2));
+        wavButton.setBounds (t.removeFromRight (bw + 4).reduced (2));
     }
     r.removeFromTop (8);
     view.setBounds (r);
 
-    // painel lateral
-    auto s = sideArea.reduced (14, 10);
-    s.removeFromTop (34);
-    auto row = s.removeFromTop (28);
-    targetBox.setBounds (row.withTrimmedLeft (100));
-    s.removeFromTop (8);
-    row = s.removeFromTop (28);
-    floorBox.setBounds (row.withTrimmedLeft (100));
-    s.removeFromTop (12);
+    // ---- painel lateral
+    auto s = sideArea.reduced (12, 10);
 
-    const int kh = 96;
+    auto tabRow = s.removeFromTop (26);
+    const int tw = tabRow.getWidth() / numSections;
+    for (int i = 0; i < numSections; ++i)
+        tabs[i].setBounds ((i == numSections - 1 ? tabRow : tabRow.removeFromLeft (tw)).reduced (1, 0));
+    s.removeFromTop (10);
+
+    titleArea = s.removeFromTop (24);
+    for (int i = 0; i < numSections; ++i)
+        power[i].setBounds (titleArea.withTrimmedLeft (titleArea.getWidth() - 56).reduced (0, 1));
+    titleArea = titleArea.withTrimmedRight (60);
+    s.removeFromTop (10);
+
+    // parte de baixo: Output + estatisticas (sempre visiveis)
+    statsArea = s.removeFromBottom (126);
+    s.removeFromBottom (4);
+    {
+        auto outRow = s.removeFromBottom (88);
+        output.setBounds (outRow.withSizeKeepingCentre (outRow.getWidth() / 3, outRow.getHeight()));
+    }
+    s.removeFromBottom (4);
+
+    // conteudo da secao
+    for (auto& row : comboRows)
+        if (row.section == currentSection)
+        {
+            row.box->setBounds (s.removeFromTop (28).withTrimmedLeft (100));
+            s.removeFromTop (6);
+        }
+    s.removeFromTop (6);
+
     auto placeRow = [&] (std::initializer_list<LabeledKnob*> knobs)
     {
-        auto line = s.removeFromTop (kh);
+        auto line = s.removeFromTop (88);
         const int kw = line.getWidth() / 3;
-        const int offset = (3 - (int) knobs.size()) * kw / 2;
-        line.removeFromLeft (offset);
+        line.removeFromLeft ((3 - (int) knobs.size()) * kw / 2);
         for (auto* k : knobs) k->setBounds (line.removeFromLeft (kw));
         s.removeFromTop (4);
     };
-    placeRow ({ &speed, &smoothing, &catchPeaks });
-    placeRow ({ &targetLevel, &floorKnob, &range });
-    placeRow ({ &output });
 
+    switch (currentSection)
+    {
+        case gateSec:   placeRow ({ &gateThresh, &gateRed, &gateMinLen }); placeRow ({ &gateClose, &gateOpen }); break;
+        case dynSec:    placeRow ({ &speed, &smoothing, &catchPeaks });   placeRow ({ &targetLevel, &floorKnob, &range }); break;
+        case breathSec: placeRow ({ &breathRed, &breathThresh, &breathTrans }); break;
+        case sibSec:    placeRow ({ &sibThresh, &sibTrans, &sibSpectral }); break;
+        default: break;
+    }
     s.removeFromTop (6);
-    statsArea = s.removeFromTop (jmin (130, s.getHeight()));
+    descArea = s.getHeight() > 30 ? s.withHeight (jmin (70, s.getHeight())).reduced (2, 0) : Rectangle<int>();
 }
 
 //------------------------------------------------------------------------------

@@ -124,7 +124,8 @@ void SilverLookAndFeel::drawButtonBackground (Graphics& g, Button& b, const Colo
 void SilverLookAndFeel::drawButtonText (Graphics& g, TextButton& b, bool, bool)
 {
     g.setFont (getTextButtonFont (b, b.getHeight()));
-    g.setColour (b.getToggleState() ? Colours::white : (b.isEnabled() ? Silver::navy : Silver::steel.withAlpha (0.6f)));
+    g.setColour (b.getToggleState() ? b.findColour (TextButton::textColourOnId)
+                                    : (b.isEnabled() ? b.findColour (TextButton::textColourOffId) : Silver::steel.withAlpha (0.6f)));
     g.drawFittedText (b.getButtonText(), b.getLocalBounds().reduced (4, 0), Justification::centred, 1);
 }
 

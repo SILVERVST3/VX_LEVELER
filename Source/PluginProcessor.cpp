@@ -52,6 +52,61 @@ AudioProcessorValueTreeState::ParameterLayout VXProcessor::createLayout()
                         .withStringFromValueFunction ([] (float v, int) { return (v > 0 ? "+" : "") + String (v, 1) + " dB"; })));
 
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamID::bypass, 1 }, "Bypass", false));
+
+    auto dbStr  = [] (float v, int) { return v <= vx::kInfDb + 0.05f ? String ("-inf dB") : String (v, 1) + " dB"; };
+    auto msStr  = [] (float v, int) { return v >= 1000.0f ? String (v / 1000.0f, 2) + " s" : String (roundToInt (v)) + " ms"; };
+    auto pctStr = [] (float v, int) { return String (roundToInt (v)) + " %"; };
+    auto msRangeOf = [] (float lo, float hi, float centre)
+    {
+        NormalisableRange<float> r (lo, hi, 1.0f);
+        r.setSkewForCentre (centre);
+        return r;
+    };
+
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { ParamID::dynOn, 1 }, "Dynamics On", true));
+
+    // ---- GATE
+    layout.add (std::make_unique<AudioParameterBool>   (ParameterID { ParamID::gateOn, 1 }, "Gate On", false));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamID::gateMode, 1 }, "Gate Mode",
+                    StringArray { "Vocal Detection", "Threshold Based" }, 0));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::gateThresh, 1 }, "Gate Threshold",
+                    NormalisableRange<float> (-80.0f, 0.0f, 0.1f), -40.0f,
+                    AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction (dbStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::gateClose, 1 }, "Gate Close Speed",
+                    msRangeOf (10.0f, 750.0f, 150.0f), 150.0f, AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (msStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::gateRed, 1 }, "Gate Reduction",
+                    NormalisableRange<float> (vx::kInfDb, 0.0f, 0.1f), vx::kInfDb,
+                    AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction (dbStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::gateOpen, 1 }, "Gate Open Speed",
+                    msRangeOf (10.0f, 750.0f, 150.0f), 150.0f, AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (msStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::gateMinLen, 1 }, "Gate Min Length",
+                    msRangeOf (50.0f, 3000.0f, 400.0f), 250.0f, AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (msStr)));
+
+    // ---- BREATH
+    layout.add (std::make_unique<AudioParameterBool>   (ParameterID { ParamID::breathOn, 1 }, "Breath On", true));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::breathRed, 1 }, "Breath Reduction",
+                    NormalisableRange<float> (vx::kInfDb, 0.0f, 0.1f, 2.0f), -3.0f,
+                    AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction (dbStr)));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamID::breathMode, 1 }, "Breath Threshold Mode",
+                    StringArray { "Auto", "Custom" }, 0));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::breathThresh, 1 }, "Breath Threshold",
+                    NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -40.0f,
+                    AudioParameterFloatAttributes().withLabel ("dB").withStringFromValueFunction (dbStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::breathTrans, 1 }, "Breath Transition",
+                    msRangeOf (20.0f, 400.0f, 80.0f), 25.0f, AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (msStr)));
+
+    // ---- SIBILANCE
+    layout.add (std::make_unique<AudioParameterBool>   (ParameterID { ParamID::sibOn, 1 }, "Sibilance On", true));
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { ParamID::sibMode, 1 }, "Sibilance Threshold Mode",
+                    StringArray { "Auto", "Custom" }, 0));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::sibThresh, 1 }, "Sibilance Threshold",
+                    NormalisableRange<float> (-60.0f, 0.0f, 0.1f), -24.0f,
+                    AudioParameterFloatAttributes().withLabel ("dBFS").withStringFromValueFunction ([] (float v, int) { return String (v, 1) + " dBFS"; })));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::sibTrans, 1 }, "Sibilance Transition",
+                    msRangeOf (1.0f, 400.0f, 40.0f), 20.0f, AudioParameterFloatAttributes().withLabel ("ms").withStringFromValueFunction (msStr)));
+    layout.add (std::make_unique<AudioParameterFloat>  (ParameterID { ParamID::sibSpectral, 1 }, "Spectral Sensitivity",
+                    NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f,
+                    AudioParameterFloatAttributes().withLabel ("%").withStringFromValueFunction (pctStr)));
     return layout;
 }
 
@@ -73,6 +128,12 @@ VXProcessor::VXProcessor()
     pOutput     = apvts.getRawParameterValue (ParamID::output);
     pBypass     = apvts.getRawParameterValue (ParamID::bypass);
 
+    for (auto* id : { ParamID::dynOn, ParamID::gateOn, ParamID::gateMode, ParamID::gateThresh, ParamID::gateClose,
+                      ParamID::gateRed, ParamID::gateOpen, ParamID::gateMinLen, ParamID::breathOn, ParamID::breathRed,
+                      ParamID::breathMode, ParamID::breathThresh, ParamID::breathTrans, ParamID::sibOn, ParamID::sibMode,
+                      ParamID::sibThresh, ParamID::sibTrans, ParamID::sibSpectral })
+        raw[id] = apvts.getRawParameterValue (id);
+
     startTimerHz (20);
 }
 
@@ -92,6 +153,25 @@ vx::Settings VXProcessor::getSettings() const
     s.floorDb    = pFloor->load();
     s.targetMode = (vx::TargetMode) jlimit (0, 3, (int) std::lround (pTargetMode->load()));
     s.targetLufs = pTarget->load();
+
+    s.dynOn          = pv (ParamID::dynOn) > 0.5f;
+    s.gateOn         = pv (ParamID::gateOn) > 0.5f;
+    s.gateMode       = pv (ParamID::gateMode) > 0.5f ? 1 : 0;
+    s.gateThreshDb   = pv (ParamID::gateThresh);
+    s.gateCloseMs    = pv (ParamID::gateClose);
+    s.gateReduction  = pv (ParamID::gateRed);
+    s.gateOpenMs     = pv (ParamID::gateOpen);
+    s.gateMinLenMs   = pv (ParamID::gateMinLen);
+    s.breathOn       = pv (ParamID::breathOn) > 0.5f;
+    s.breathReduction= pv (ParamID::breathRed);
+    s.breathAuto     = pv (ParamID::breathMode) < 0.5f;
+    s.breathThreshDb = pv (ParamID::breathThresh);
+    s.breathTransMs  = pv (ParamID::breathTrans);
+    s.sibOn          = pv (ParamID::sibOn) > 0.5f;
+    s.sibAuto        = pv (ParamID::sibMode) < 0.5f;
+    s.sibThreshDb    = pv (ParamID::sibThresh);
+    s.sibTransMs     = pv (ParamID::sibTrans);
+    s.sibSpectral    = pv (ParamID::sibSpectral) * 0.01f;
     return s;
 }
 
@@ -178,9 +258,9 @@ static std::shared_ptr<const vx::GainCurve> applyEdits (const vx::GainCurve& bas
     {
         const float e = i < edits.size() ? edits[i] : 0.0f;
         if (std::abs (e) > 1.0e-6f) any = true;
-        const float g = jlimit (-48.0f, 24.0f, c->autoDb[i] + e);
+        const float g = jlimit (vx::kInfDb, 24.0f, c->autoDb[i] + e);
         c->gainDb[i]  = g;
-        c->gainLin[i] = vx::dbToLin (g);
+        c->gainLin[i] = g <= vx::kInfDb + 0.01f ? 0.0f : vx::dbToLin (g);
     }
     if (any)
         c->outputLufsI = vx::integratedLoudness (analysis.ms, c->gainDb.data());
@@ -220,11 +300,13 @@ void VXProcessor::refreshCurves()
 
         mod->ensureSize (analysis->numFrames());
 
-        if (e.source != src || e.base == nullptr || e.analysisVersion != src->getAnalysisVersion() || e.settings != settings)
+        if (e.source != src || e.base == nullptr || e.analysisVersion != src->getAnalysisVersion()
+            || e.settings != settings || e.regionsVersion != mod->regionsVersion)
         {
             e.source = src;
-            e.base = vx::computeGainCurve (*analysis, settings, nullptr);
+            e.base = vx::computeGainCurve (*analysis, settings, nullptr, &mod->disabledRegions);
             e.analysisVersion = src->getAnalysisVersion();
+            e.regionsVersion = mod->regionsVersion;
             e.settings = settings;
             e.editsVersion = -1;
         }

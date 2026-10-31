@@ -23,21 +23,40 @@ int main (int argc, char** argv)
     proc->setPlayConfigDetails (2, 2, 48000.0, 512);
     proc->prepareToPlay (48000.0, 512);
 
-    // sinal de teste: frases com niveis diferentes
+    // sinal de teste: voz harmonica, respiros e sibilantes
     std::vector<float> x;
     std::mt19937 rng (1);
     std::normal_distribution<float> nd (0.0f, 1.0f);
-    float lp = 0.0f;
-    const float levels[] = { -14, -30, -20, -10, -26, -16 };
-    for (float db : levels)
     {
-        for (int i = 0; i < 48000 * 2; ++i)
+        const double fs = 48000.0;
+        const float levels[] = { -14, -30, -20, -10, -26, -16 };
+        vx::Biquad bpBreath, hpSib;
+        bpBreath.setBandpass (fs, 2500.0, 0.7);
+        hpSib.setHighpass (fs, 5500.0, 0.7);
+        double ph = 0.0;
+        for (float db : levels)
         {
-            lp += 0.2f * (nd (rng) - lp);
-            const float syl = 0.5f + 0.5f * std::abs (std::sin (3.14159f * 3.0f * (float) i / 48000.0f));
-            x.push_back (lp * syl * std::pow (10.0f, db / 20.0f) * 3.0f);
+            const float a = std::pow (10.0f, db / 20.0f);
+            for (int syl = 0; syl < 6; ++syl)
+            {
+                const size_t len = (size_t) (fs * 0.28);
+                const double f0 = 140.0 + 30.0 * syl;
+                for (size_t i = 0; i < len; ++i)
+                {
+                    ph += 2.0 * 3.14159265 * f0 / fs;
+                    double v = 0.0;
+                    for (int h = 1; h <= 12; ++h) v += std::sin (ph * h) / h;
+                    const float env = (float) std::sin (3.14159 * (double) i / (double) len);
+                    x.push_back ((float) v * 0.5f * a * (0.3f + 0.7f * env) + nd (rng) * 0.0003f);
+                }
+                if (syl == 2)
+                    for (size_t i = 0; i < (size_t) (fs * 0.09); ++i) x.push_back ((float) hpSib.process (nd (rng)) * a * 1.6f);
+            }
+            for (size_t i = 0; i < (size_t) (fs * 0.25); ++i) x.push_back (nd (rng) * 0.0004f);
+            for (size_t i = 0; i < (size_t) (fs * 0.35); ++i)
+                x.push_back ((float) bpBreath.process (nd (rng)) * 0.05f * (float) std::sin (3.14159 * (double) i / (fs * 0.35)));
+            for (size_t i = 0; i < (size_t) (fs * 0.25); ++i) x.push_back (nd (rng) * 0.0004f);
         }
-        for (int i = 0; i < 48000 * 6 / 10; ++i) x.push_back (nd (rng) * 0.0004f);
     }
 
     juce::AudioBuffer<float> buf (2, 512);
@@ -59,7 +78,11 @@ int main (int argc, char** argv)
     std::shared_ptr<const vx::Analysis> analysis = an.finish();
     std::vector<float> edits ((size_t) analysis->numFrames(), 0.0f);
     for (int f = 820; f < 1000; ++f) edits[(size_t) f] = -4.0f * (float) std::sin (3.14159 * (f - 820) / 180.0);
-    auto curve = vx::computeGainCurve (*analysis, vx::Settings(), &edits);
+    vx::Settings st;
+    st.gateOn = true; st.gateReduction = -18.0f;
+    auto curve = vx::computeGainCurve (*analysis, st, &edits);
+    printf ("dur %.2f s frames %d gate %d breath %d sib %d floor %.1f in %.1f\n", x.size() / 48000.0, analysis->numFrames(), curve->numGate, curve->numBreath, curve->numSib, curve->floorDb, curve->inputLufsI);
+    for (auto& r : curve->regions) printf ("  t%d %.2f-%.2f %.1f\n", (int) r.type, r.startFrame * 0.01, r.endFrame * 0.01, r.depthDb);
 
     for (auto* c : ed->getChildren())
         if (auto* v = dynamic_cast<LevelerView*> (c))
@@ -71,6 +94,16 @@ int main (int argc, char** argv)
             v->previewLanes.push_back (d);
         }
     save (*ed, argc > 2 ? argv[2] : "snap_ara.png");
+
+    // capturas das outras abas
+    int idx = 0;
+    for (auto* name : { "GATE", "BREATH", "SIBILANCE" })
+    {
+        for (auto* c : ed->getChildren())
+            if (auto* b = dynamic_cast<juce::TextButton*> (c))
+                if (b->getButtonText() == name && b->onClick) { b->setToggleState (true, juce::dontSendNotification); b->onClick(); }
+        save (*ed, juce::String ("/tmp/snap_tab") + juce::String (idx++) + ".png");
+    }
 
     ed.reset();
     proc.reset();

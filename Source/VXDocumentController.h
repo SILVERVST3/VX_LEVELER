@@ -71,6 +71,23 @@ public:
     std::vector<float> editsDb;
     int editsVersion = 0;
 
+    /** regioes (pausa/respiro/sibilante) desligadas pelo usuario */
+    std::vector<vx::RegionKey> disabledRegions;
+    int regionsVersion = 0;
+
+    void toggleRegion (vx::RegionType type, int startFrame)
+    {
+        for (auto it = disabledRegions.begin(); it != disabledRegions.end(); ++it)
+            if (it->type == (int) type && std::abs (it->startFrame - startFrame) <= 6)
+            {
+                disabledRegions.erase (it);
+                ++regionsVersion;
+                return;
+            }
+        disabledRegions.push_back ({ (int) type, startFrame });
+        ++regionsVersion;
+    }
+
     void ensureSize (int numFrames)
     {
         if ((int) editsDb.size() < numFrames) editsDb.resize ((size_t) numFrames, 0.0f);
@@ -129,6 +146,13 @@ private:
     int maxBlock = 512, numChannels = 2;
 
     std::shared_ptr<const VXCurveMap> curves;
+
+    struct DeEssState
+    {
+        vx::SpectralDeEsser filter;
+        juce::int64 expectedSource = -1;
+    };
+    std::map<const juce::ARAPlaybackRegion*, DeEssState> deEssers;
     std::deque<std::shared_ptr<const VXCurveMap>> keepAlive;   // evita liberar memoria na thread de audio
 };
 
@@ -143,6 +167,13 @@ public:
 
     juce::ScopedTryReadLock getProcessingLock() { return juce::ScopedTryReadLock { processLock }; }
     juce::ARADocument* getDocumentPtr() const noexcept { return document; }
+
+    /** inicia a analise das fontes com acesso liberado (thread de mensagens) */
+    void scheduleAnalyses();
+    /** reinicia a analise de todas as fontes */
+    void reanalyseAll();
+    /** texto de diagnostico para a interface */
+    juce::String getDiagnostics() const;
 
     /** contador que muda sempre que o modelo ARA muda (editores redesenham) */
     std::atomic<int> modelVersion { 0 };
@@ -166,7 +197,6 @@ protected:
 
 private:
     friend class VXAnalysisScheduler;
-    void scheduleAnalyses();
     std::unique_ptr<juce::Timer> scheduler;   // timer fica no .cpp (pimpl)
 
     juce::ReadWriteLock processLock;
