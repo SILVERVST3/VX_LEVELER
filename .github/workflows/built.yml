@@ -1,0 +1,29 @@
+name: Build VX_Leveler SILVER (VST3 + ARA)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar JUCE 8.0.4
+        run: git clone --depth 1 --branch 8.0.4 https://github.com/juce-framework/JUCE.git JUCE
+
+      - name: Baixar ARA SDK 2.2.0
+        run: git clone --recursive --branch releases/2.2.0 https://github.com/Celemony/ARA_SDK.git ARA_SDK
+
+      - name: Configurar
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compilar
+        run: cmake --build build --config Release --target VX_Leveler_SILVER_VST3 --parallel
+
+      - name: Publicar VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: VX_Leveler_SILVER_VST3_Windows
+          path: build/VX_Leveler_SILVER_artefacts/Release/VST3/
