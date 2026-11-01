@@ -249,14 +249,18 @@ void VXProcessor::processBlock (AudioBuffer<float>& buffer, MidiBuffer&)
 
 //==============================================================================
 static std::shared_ptr<const vx::GainCurve> applyEdits (const vx::GainCurve& base,
-                                                        const std::vector<float>& edits,
+                                                        const VXAudioModification& mod,
                                                         const vx::Analysis& analysis)
 {
     auto c = std::make_shared<vx::GainCurve> (base);
+    const auto& edits = mod.editsDb;
+    const bool hasNodes = ! mod.nodes.empty();
+    const double frameSec = (double) c->hopSamples / c->sampleRate;
     bool any = false;
     for (size_t i = 0; i < c->gainDb.size(); ++i)
     {
-        const float e = i < edits.size() ? edits[i] : 0.0f;
+        float e = i < edits.size() ? edits[i] : 0.0f;
+        if (hasNodes) e += mod.nodeEnvAt (((double) i + 0.5) * frameSec);   // pincel + nos
         if (std::abs (e) > 1.0e-6f) any = true;
         const float g = jlimit (vx::kInfDb, 24.0f, c->autoDb[i] + e);
         c->gainDb[i]  = g;
@@ -288,6 +292,21 @@ void VXProcessor::refreshCurves()
         if (src == nullptr) continue;
         if (! present.insert (mod).second) continue;
 
+        // copia de seguranca: usada so se o arquivo ARA do projeto nao trouxe nada para este clipe
+        {
+            const ScopedLock sl (backupLock);
+            auto pb = pendingBackup.find (String (mod->getPersistentID()));
+            if (pb != pendingBackup.end())
+            {
+                if (! mod->restoredFromArchive && ! mod->hasEdits() && mod->disabledRegions.empty())
+                {
+                    pb->second.applyTo (*mod);
+                    mod->notifyContentChanged (ARAContentUpdateScopes::samplesAreAffected(), false);
+                }
+                pendingBackup.erase (pb);
+            }
+        }
+
         auto analysis = src->getAnalysis();
         auto& e = cache[mod];
 
@@ -313,7 +332,7 @@ void VXProcessor::refreshCurves()
 
         if (e.full == nullptr || e.editsVersion != mod->editsVersion)
         {
-            e.full = applyEdits (*e.base, mod->editsDb, *analysis);
+            e.full = applyEdits (*e.base, *mod, *analysis);
             e.editsVersion = mod->editsVersion;
             changed = true;
         }
@@ -332,6 +351,7 @@ void VXProcessor::refreshCurves()
             if (e.full != nullptr) (*map)[mod] = e.full;
         renderer->publishCurves (map);
         ++curvesVersion;
+        updateBackup();
     }
 }
 
@@ -342,17 +362,84 @@ std::shared_ptr<const vx::GainCurve> VXProcessor::getCurveFor (const ARAAudioMod
 }
 
 //==============================================================================
+static const char* kBackupTag = "VXEditsBackup";
+
+void VXProcessor::markDirty()
+{
+    updateHostDisplay (ChangeDetails().withNonParameterStateChanged (true));
+}
+
+void VXProcessor::updateBackup()
+{
+    auto* renderer = getRenderer();
+    if (renderer == nullptr) return;
+
+    bool changed = false;
+    std::vector<VXAudioModification*> mods;
+    for (auto* region : renderer->getPlaybackRegions())
+        if (auto* m = dynamic_cast<VXAudioModification*> (region->getAudioModification()))
+            if (std::find (mods.begin(), mods.end(), m) == mods.end())
+            {
+                mods.push_back (m);
+                const auto v = std::make_pair (m->editsVersion, m->regionsVersion);
+                auto it = backupVersions.find (m);
+                if (it == backupVersions.end() || it->second != v) { backupVersions[m] = v; changed = true; }
+            }
+
+    if (! changed && backupXml != nullptr) return;
+
+    auto xml = std::make_unique<XmlElement> (kBackupTag);
+    for (auto* m : mods)
+    {
+        const auto st = VXModState::from (*m);
+        if (st.isEmpty()) continue;
+        MemoryOutputStream mo;
+        st.write (mo);
+        auto* clip = xml->createNewChildElement ("Clip");
+        clip->setAttribute ("id", String (m->getPersistentID()));
+        clip->setAttribute ("data", mo.getMemoryBlock().toBase64Encoding());
+    }
+    const ScopedLock sl (backupLock);
+    backupXml = std::move (xml);
+}
+
 void VXProcessor::getStateInformation (MemoryBlock& dest)
 {
     if (auto xml = apvts.copyState().createXml())
+    {
+        xml->deleteAllChildElementsWithTagName (kBackupTag);
+        {
+            const ScopedLock sl (backupLock);
+            if (backupXml != nullptr && backupXml->getNumChildElements() > 0)
+                xml->addChildElement (new XmlElement (*backupXml));
+        }
         copyXmlToBinary (*xml, dest);
+    }
 }
 
 void VXProcessor::setStateInformation (const void* data, int size)
 {
     if (auto xml = getXmlFromBinary (data, size))
+    {
+        if (auto* bk = xml->getChildByName (kBackupTag))
+        {
+            const ScopedLock sl (backupLock);
+            for (auto* clip : bk->getChildWithTagNameIterator ("Clip"))
+            {
+                MemoryBlock mb;
+                if (! mb.fromBase64Encoding (clip->getStringAttribute ("data"))) continue;
+                MemoryInputStream mi (mb, false);
+                VXModState st;
+                if (st.read (mi))
+                    pendingBackup[clip->getStringAttribute ("id")] = std::move (st);
+            }
+            backupXml = std::make_unique<XmlElement> (*bk);
+        }
+        xml->deleteAllChildElementsWithTagName (kBackupTag);
+
         if (xml->hasTagName (apvts.state.getType()))
             apvts.replaceState (ValueTree::fromXml (*xml));
+    }
 }
 
 AudioProcessorEditor* VXProcessor::createEditor()

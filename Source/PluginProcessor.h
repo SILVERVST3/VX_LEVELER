@@ -101,6 +101,9 @@ public:
 
     vx::RealtimeLeveler& getRealtime() noexcept { return realtime; }
 
+    /** avisa o host que o projeto mudou (o REAPER passa a pedir para salvar) */
+    void markDirty();
+
     std::atomic<double> playheadSeconds { 0.0 };
     std::atomic<bool>   playing { false };
     std::atomic<float>  realtimeGainDb { 0.0f };
@@ -133,6 +136,13 @@ private:
     std::atomic<float>* pTarget = nullptr;
     std::atomic<float>* pOutput = nullptr;
     std::atomic<float>* pBypass = nullptr;
+
+    // copia de seguranca das edicoes manuais dentro do estado do plugin
+    juce::CriticalSection backupLock;
+    std::unique_ptr<juce::XmlElement> backupXml;
+    std::map<juce::String, VXModState> pendingBackup;
+    std::map<const juce::ARAAudioModification*, std::pair<int, int>> backupVersions;
+    void updateBackup();
 
     std::map<juce::String, std::atomic<float>*> raw;
     float pv (const char* id) const { auto it = raw.find (id); return it != raw.end() ? it->second->load() : 0.0f; }

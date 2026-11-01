@@ -377,8 +377,49 @@ void LevelerView::paintARA (Graphics& g, Rectangle<int> plot)
         }
     }
 
+    // nos (ferramenta Nos)
+    {
+        const auto drawLanes = getLanes();
+        for (auto& l : drawLanes)
+        {
+            const auto& nodes = l.mod->nodes;
+            if (nodes.empty()) continue;
+            Path env;
+            bool first = true;
+            for (int i = 0; i < (int) nodes.size(); ++i)
+            {
+                const double tPlay = nodes[(size_t) i].t - l.modStart + l.playStart;
+                const Point<float> pt (xForTime (tPlay), nodeY (l, nodes[(size_t) i].t));
+                if (first) { env.startNewSubPath (pt); first = false; } else env.lineTo (pt);
+            }
+            if (tool == Tool::nodes)
+            {
+                g.setColour (Silver::contrast.withAlpha (0.35f));
+                g.strokePath (env, PathStrokeType (1.0f));
+            }
+            for (int i = 0; i < (int) nodes.size(); ++i)
+            {
+                const double tPlay = nodes[(size_t) i].t - l.modStart + l.playStart;
+                const float nx = xForTime (tPlay), ny = nodeY (l, nodes[(size_t) i].t);
+                const bool hot = (hoverNode.mod == l.mod && hoverNode.index == i) || (dragNode.mod == l.mod && dragNode.index == i);
+                const float r = tool == Tool::nodes ? (hot ? 6.5f : 5.0f) : 3.0f;
+                g.setColour (Colours::white);
+                g.fillEllipse (nx - r - 1.5f, ny - r - 1.5f, 2 * r + 3.0f, 2 * r + 3.0f);
+                g.setColour (hot ? Silver::contrast : Silver::navy);
+                g.fillEllipse (nx - r, ny - r, 2 * r, 2 * r);
+                if (hot)
+                {
+                    const float v = nodes[(size_t) i].db;
+                    g.setFont (FontOptions (11.0f, Font::bold));
+                    g.setColour (Silver::navy);
+                    g.drawText ((v > 0 ? "+" : "") + String (v, 1) + " dB", (int) nx - 30, (int) ny - 24, 60, 14, Justification::centred);
+                }
+            }
+        }
+    }
+
     // pincel de edicao
-    if (hovering || dragging)
+    if (tool == Tool::brush && (hovering || dragging))
     {
         const double centre = dragging ? dragCentre : timeForX (hoverX);
         const float bx0 = xForTime (centre - brushSeconds * 0.5), bx1 = xForTime (centre + brushSeconds * 0.5);
@@ -456,6 +497,11 @@ void LevelerView::mouseMove (const MouseEvent& e)
 {
     hovering = proc.isBoundToARA() && getPlotArea().contains (e.getPosition());
     hoverX = (float) e.x;
+    if (tool == Tool::nodes)
+    {
+        hoverNode = findNode (e.position);
+        setMouseCursor (hoverNode.mod != nullptr ? MouseCursor::DraggingHandCursor : MouseCursor::CrosshairCursor);
+    }
     repaint();
 }
 
@@ -467,7 +513,9 @@ void LevelerView::mouseExit (const MouseEvent&)
 
 void LevelerView::mouseDown (const MouseEvent& e)
 {
-    if (! proc.isBoundToARA() || ! getPlotArea().contains (e.getPosition()) || e.mods.isPopupMenu())
+    if (! proc.isBoundToARA() || ! getPlotArea().contains (e.getPosition()))
+        return;
+    if (e.mods.isPopupMenu() && tool != Tool::nodes)
         return;
 
     // clique na faixa de regioes: liga/desliga a regiao
@@ -500,26 +548,162 @@ void LevelerView::mouseDown (const MouseEvent& e)
     }
 
     autoFit = false;
+
+    if (tool == Tool::nodes)
+    {
+        mouseDownNodes (e);
+        return;
+    }
+
     dragging = true;
     dragCentre = timeForX ((float) e.x);
     dragStartY = (float) e.y;
 
-    dragSnapshot.clear();
+    for (auto& l : getLanes())
+        if (l.source->getAnalysis() != nullptr)
+            l.mod->ensureSize (l.source->getAnalysis()->numFrames());
+    pushUndo();
+    dragSnapshot = undoStack.back();
+}
+
+void LevelerView::pushUndo (VXAudioModification* onlyThis)
+{
+    std::vector<Snapshot> snap;
     for (auto& l : getLanes())
     {
-        if (l.source->getAnalysis() == nullptr) continue;
-        l.mod->ensureSize (l.source->getAnalysis()->numFrames());
+        if (onlyThis != nullptr && l.mod != onlyThis) continue;
         bool dup = false;
-        for (auto& s : dragSnapshot) if (s.mod == l.mod) dup = true;
-        if (! dup) dragSnapshot.push_back ({ l.mod, l.mod->editsDb });
+        for (auto& sn : snap) if (sn.mod == l.mod) dup = true;
+        if (! dup) snap.push_back ({ l.mod, l.mod->editsDb, l.mod->nodes });
     }
-    undoStack.push_back (dragSnapshot);
+    undoStack.push_back (std::move (snap));
     if (undoStack.size() > 50) undoStack.erase (undoStack.begin());
+}
+
+void LevelerView::setTool (Tool t)
+{
+    tool = t;
+    hoverNode = {};
+    setMouseCursor (t == Tool::brush ? MouseCursor::UpDownResizeCursor : MouseCursor::CrosshairCursor);
+    repaint();
+}
+
+float LevelerView::nodeY (const Lane& lane, double srcT) const
+{
+    if (auto c = proc.getCurveFor (lane.mod))
+        return yForGain (c->gainDbAtTime (srcT));
+    return yForGain (lane.mod->nodeEnvAt (srcT));
+}
+
+LevelerView::NodeHit LevelerView::findNode (Point<float> pos) const
+{
+    NodeHit best;
+    float bestD = 10.0f;
+    for (auto& l : getLanes())
+    {
+        for (int i = 0; i < (int) l.mod->nodes.size(); ++i)
+        {
+            const auto& nd = l.mod->nodes[(size_t) i];
+            const double tPlay = nd.t - l.modStart + l.playStart;
+            if (tPlay < l.playStart - 1.0e-6 || tPlay > l.playEnd + 1.0e-6) continue;
+            const float d = pos.getDistanceFrom ({ xForTime (tPlay), nodeY (l, nd.t) });
+            if (d < bestD)
+            {
+                bestD = d;
+                best.mod = l.mod; best.index = i;
+                best.playStart = l.playStart; best.modStart = l.modStart;
+                best.modEnd = l.modStart + (l.playEnd - l.playStart);
+            }
+        }
+    }
+    return best;
+}
+
+void LevelerView::mouseDownNodes (const MouseEvent& e)
+{
+    auto hit = findNode (e.position);
+
+    // Alt+clique ou botao direito: apaga o no
+    if (hit.mod != nullptr && (e.mods.isAltDown() || e.mods.isPopupMenu()))
+    {
+        pushUndo (hit.mod);
+        hit.mod->nodes.erase (hit.mod->nodes.begin() + hit.index);
+        hit.mod->notifyEdited();
+        hoverNode = {};
+        proc.refreshCurves();
+        if (onEditsChanged) onEditsChanged();
+        repaint();
+        return;
+    }
+    if (e.mods.isPopupMenu()) return;
+
+    if (hit.mod == nullptr)
+    {
+        // clique fora de um no: cria um no novo no valor atual do envelope (o som nao muda)
+        const double t = timeForX ((float) e.x);
+        for (auto& l : getLanes())
+        {
+            if (t < l.playStart || t >= l.playEnd) continue;
+            const double srcT = t - l.playStart + l.modStart;
+            pushUndo (l.mod);
+            auto& nodes = l.mod->nodes;
+            VXAudioModification::Node nd { srcT, l.mod->nodeEnvAt (srcT) };
+            auto it = std::lower_bound (nodes.begin(), nodes.end(), srcT,
+                                        [] (const VXAudioModification::Node& a, double v) { return a.t < v; });
+            const int idx = (int) std::distance (nodes.begin(), it);
+            nodes.insert (it, nd);
+            ++l.mod->editsVersion;
+            hit.mod = l.mod; hit.index = idx;
+            hit.playStart = l.playStart; hit.modStart = l.modStart;
+            hit.modEnd = l.modStart + (l.playEnd - l.playStart);
+            break;
+        }
+        if (hit.mod == nullptr) return;
+    }
+    else
+    {
+        pushUndo (hit.mod);
+    }
+
+    dragNode = hit;
+    dragNodeStartT  = hit.mod->nodes[(size_t) hit.index].t;
+    dragNodeStartDb = hit.mod->nodes[(size_t) hit.index].db;
+    dragStartX = (float) e.x;
+    dragStartY = (float) e.y;
+    dragging = true;
+    proc.refreshCurves();
+    repaint();
+}
+
+void LevelerView::mouseDragNodes (const MouseEvent& e)
+{
+    auto* mod = dragNode.mod;
+    if (mod == nullptr || dragNode.index < 0 || dragNode.index >= (int) mod->nodes.size()) return;
+
+    const float pxPerDb = getPlotArea().getHeight() * 0.46f / gainScaleDb();
+    const float fine = e.mods.isShiftDown() ? 0.2f : 1.0f;
+    auto& nd = mod->nodes[(size_t) dragNode.index];
+
+    nd.db = jlimit (-24.0f, 24.0f, dragNodeStartDb + (dragStartY - (float) e.y) / pxPerDb * fine);
+
+    if (! e.mods.isShiftDown())   // Shift: so vertical
+    {
+        const double secPerPx = (viewEnd - viewStart) / jmax (1, getPlotArea().getWidth());
+        double t = dragNodeStartT + ((float) e.x - dragStartX) * secPerPx;
+        const double lo = dragNode.index > 0 ? mod->nodes[(size_t) dragNode.index - 1].t + 0.01 : dragNode.modStart;
+        const double hi = dragNode.index + 1 < (int) mod->nodes.size() ? mod->nodes[(size_t) dragNode.index + 1].t - 0.01 : dragNode.modEnd;
+        nd.t = jlimit (lo, jmax (lo, hi), t);
+    }
+
+    ++mod->editsVersion;
+    proc.refreshCurves();
+    repaint();
 }
 
 void LevelerView::mouseDrag (const MouseEvent& e)
 {
     if (! dragging) return;
+    if (tool == Tool::nodes) { mouseDragNodes (e); return; }
 
     const float pxPerDb = getPlotArea().getHeight() * 0.46f / gainScaleDb();
     const float fine = e.mods.isShiftDown() ? 0.2f : 1.0f;
@@ -564,15 +748,31 @@ void LevelerView::mouseUp (const MouseEvent&)
 {
     if (! dragging) return;
     dragging = false;
-    for (auto& s : dragSnapshot) s.mod->notifyEdited();
+    if (dragNode.mod != nullptr) { dragNode.mod->notifyEdited(); dragNode = {}; }
+    for (auto& sn : dragSnapshot) sn.mod->notifyEdited();
     dragSnapshot.clear();
     proc.refreshCurves();
     if (onEditsChanged) onEditsChanged();
     repaint();
 }
 
-void LevelerView::mouseDoubleClick (const MouseEvent&)
+void LevelerView::mouseDoubleClick (const MouseEvent& e)
 {
+    if (tool == Tool::nodes)
+    {
+        auto hit = findNode (e.position);
+        if (hit.mod != nullptr)
+        {
+            // o 1o clique ja guardou o estado para desfazer
+            hit.mod->nodes.erase (hit.mod->nodes.begin() + hit.index);
+            hit.mod->notifyEdited();
+            hoverNode = {};
+            proc.refreshCurves();
+            if (onEditsChanged) onEditsChanged();
+            repaint();
+            return;
+        }
+    }
     autoFit = true;
     repaint();
 }
@@ -617,6 +817,7 @@ void LevelerView::undo()
         for (auto& l : lanes) if (l.mod == s.mod) alive = true;
         if (! alive) continue;
         s.mod->editsDb = s.edits;
+        s.mod->nodes = s.nodes;
         s.mod->notifyEdited();
     }
     proc.refreshCurves();
@@ -632,8 +833,9 @@ void LevelerView::clearEdits()
         bool dup = false;
         for (auto& s : snap) if (s.mod == l.mod) dup = true;
         if (dup || ! l.mod->hasEdits()) continue;
-        snap.push_back ({ l.mod, l.mod->editsDb });
+        snap.push_back ({ l.mod, l.mod->editsDb, l.mod->nodes });
         std::fill (l.mod->editsDb.begin(), l.mod->editsDb.end(), 0.0f);
+        l.mod->nodes.clear();
         l.mod->notifyEdited();
     }
     if (! snap.empty()) undoStack.push_back (std::move (snap));
@@ -753,7 +955,7 @@ VXEditor::VXEditor (VXProcessor& p)
     setLookAndFeel (&lnf);
 
     addAndMakeVisible (view);
-    view.onEditsChanged = [this] { updateEnablement(); };
+    view.onEditsChanged = [this] { updateEnablement(); proc.markDirty(); };
 
     // ---- abas das secoes
     const char* tabNames[numSections]  = { "GATE", "DYNAMICS", "BREATH", "SIBILANCE" };
@@ -808,8 +1010,21 @@ VXEditor::VXEditor (VXProcessor& p)
     sibSpectral.slider.setTooltip ("Parte espectral: corta so as frequencias mais agudas do S. 0% = so reducao de nivel.");
 
     // ---- barra de ferramentas
-    for (auto* b : { &bypassButton, &undoButton, &clearButton, &fitButton, &reanalyseButton, &wavButton, &midiButton })
+    for (auto* b : { &bypassButton, &undoButton, &clearButton, &fitButton, &reanalyseButton, &wavButton, &midiButton,
+                     &brushButton, &nodesButton })
         addAndMakeVisible (*b);
+
+    for (auto* b : { &brushButton, &nodesButton })
+    {
+        b->setClickingTogglesState (true);
+        b->setRadioGroupId (4712);
+    }
+    brushButton.setToggleState (true, dontSendNotification);
+    brushButton.onClick = [this] { view.setTool (LevelerView::Tool::brush); repaint(); };
+    nodesButton.onClick = [this] { view.setTool (LevelerView::Tool::nodes); repaint(); };
+    brushButton.setTooltip ("Pincel (B): arraste para cima/baixo para mudar o ganho de um trecho");
+    nodesButton.setTooltip ("Nos (N): clique na curva para criar um ponto e arraste. Alt+clique / duplo clique / botao direito apaga");
+    setWantsKeyboardFocus (true);
 
     bypassButton.setClickingTogglesState (true);
     bypassAtt = std::make_unique<AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, ParamID::bypass, bypassButton);
@@ -827,7 +1042,7 @@ VXEditor::VXEditor (VXProcessor& p)
 
     // ARA exige editor redimensionavel
     setResizable (true, true);
-    setResizeLimits (980, 660, 2600, 1600);
+    setResizeLimits (1040, 660, 2600, 1600);
     setSize (1120, 720);
 
     tabs[dynSec].setToggleState (true, dontSendNotification);
@@ -841,6 +1056,15 @@ VXEditor::~VXEditor()
 {
     stopTimer();
     setLookAndFeel (nullptr);
+}
+
+bool VXEditor::keyPressed (const KeyPress& key)
+{
+    const auto c = CharacterFunctions::toLowerCase (key.getTextCharacter());
+    if (c == 'b') { brushButton.setToggleState (true, sendNotification); view.setTool (LevelerView::Tool::brush); repaint(); return true; }
+    if (c == 'n') { nodesButton.setToggleState (true, sendNotification); view.setTool (LevelerView::Tool::nodes); repaint(); return true; }
+    if (key == KeyPress ('z', ModifierKeys::commandModifier, 0)) { view.undo(); return true; }
+    return false;
 }
 
 void VXEditor::addCombo (ComboBox& box, const StringArray& items, const char* paramID,
@@ -1051,7 +1275,9 @@ void VXEditor::paint (Graphics& g)
     g.setColour (Silver::steel);
     g.setFont (FontOptions (11.5f));
     auto hint = getLocalBounds().removeFromBottom (20).withTrimmedLeft (sideArea.getRight() + 10).withTrimmedRight (12);
-    g.drawText ("Arraste: ganho  |  Shift+roda: pincel  |  Ctrl+roda: zoom  |  clique na faixa: liga/desliga regiao",
+    g.drawText (view.getTool() == LevelerView::Tool::brush
+                    ? "Pincel: arraste = ganho  |  Shift+roda: largura  |  Ctrl+roda: zoom  |  faixa: liga/desliga regiao"
+                    : "Nos: clique = novo ponto, arraste = move (Shift = so vertical)  |  Alt+clique/duplo clique: apaga",
                 hint.removeFromLeft (hint.getWidth() / 2), Justification::centredLeft, true);
     g.setColour (diagText.startsWith ("ARA NAO") ? Silver::contrast : Silver::navyMid);
     g.drawText (diagText, hint, Justification::centredRight, true);
@@ -1071,15 +1297,18 @@ void VXEditor::resized()
     toolbarArea = r.removeFromTop (32);
     {
         auto t = toolbarArea;
-        const int bw = 100;
-        bypassButton.setBounds (t.removeFromLeft (bw).reduced (2));
-        t.removeFromLeft (10);
-        undoButton.setBounds (t.removeFromLeft (70).reduced (2));
+        const int bw = 92;
+        bypassButton.setBounds (t.removeFromLeft (80).reduced (2));
+        t.removeFromLeft (8);
+        undoButton.setBounds (t.removeFromLeft (62).reduced (2));
         clearButton.setBounds (t.removeFromLeft (bw).reduced (2));
-        fitButton.setBounds (t.removeFromLeft (52).reduced (2));
+        fitButton.setBounds (t.removeFromLeft (46).reduced (2));
         reanalyseButton.setBounds (t.removeFromLeft (bw).reduced (2));
-        midiButton.setBounds (t.removeFromRight (bw + 4).reduced (2));
-        wavButton.setBounds (t.removeFromRight (bw + 4).reduced (2));
+        t.removeFromLeft (10);
+        brushButton.setBounds (t.removeFromLeft (70).reduced (2));
+        nodesButton.setBounds (t.removeFromLeft (58).reduced (2));
+        midiButton.setBounds (t.removeFromRight (bw).reduced (2));
+        wavButton.setBounds (t.removeFromRight (bw).reduced (2));
     }
     r.removeFromTop (8);
     view.setBounds (r);

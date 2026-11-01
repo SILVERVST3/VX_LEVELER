@@ -131,6 +131,173 @@ void VXAudioSource::invalidateAnalysis()
     state = needsAnalysis;
 }
 
+void VXAudioSource::setRestoredAnalysis (std::shared_ptr<const vx::Analysis> a)
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+    if (a == nullptr) return;
+    stopAnalysis();
+    std::atomic_store (&analysis, a);
+    analysisVersion.fetch_add (1);
+    retries = 0;
+    progress = 1.0f;
+    state = ready;
+}
+
+//==============================================================================
+VXModState VXModState::from (const VXAudioModification& m)
+{
+    VXModState st;
+    st.edits = m.editsDb;
+    st.disabled = m.disabledRegions;
+    st.nodes = m.nodes;
+    return st;
+}
+
+void VXModState::applyTo (VXAudioModification& m) const
+{
+    m.editsDb = edits;
+    m.disabledRegions = disabled;
+    m.nodes = nodes;
+    ++m.editsVersion;
+    ++m.regionsVersion;
+}
+
+bool VXModState::isEmpty() const
+{
+    for (auto v : edits) if (std::abs (v) > 1.0e-6f) return false;
+    return disabled.empty() && nodes.empty();
+}
+
+void VXModState::write (OutputStream& out) const
+{
+    // edicoes do pincel em trechos nao nulos: [inicio, tamanho, valores...]
+    std::vector<std::pair<int, int>> runs;
+    for (int i = 0; i < (int) edits.size();)
+    {
+        if (std::abs (edits[(size_t) i]) <= 1.0e-6f) { ++i; continue; }
+        int j = i;
+        while (j < (int) edits.size() && std::abs (edits[(size_t) j]) > 1.0e-6f) ++j;
+        runs.push_back ({ i, j - i });
+        i = j;
+    }
+    out.writeInt ((int) edits.size());
+    out.writeInt ((int) runs.size());
+    for (auto& r : runs)
+    {
+        out.writeInt (r.first);
+        out.writeInt (r.second);
+        out.write (edits.data() + r.first, (size_t) r.second * sizeof (float));
+    }
+    out.writeInt ((int) disabled.size());
+    for (auto& k : disabled) { out.writeInt (k.type); out.writeInt (k.startFrame); }
+    out.writeInt ((int) nodes.size());
+    for (auto& n : nodes) { out.writeDouble (n.t); out.writeFloat (n.db); }
+}
+
+bool VXModState::read (InputStream& in)
+{
+    const int total = in.readInt();
+    if (total < 0 || total > 100000000) return false;
+    edits.assign ((size_t) total, 0.0f);
+    const int nRuns = in.readInt();
+    for (int r = 0; r < nRuns && ! in.isExhausted(); ++r)
+    {
+        const int start = in.readInt(), len = in.readInt();
+        if (start < 0 || len < 0 || start + len > total) return false;
+        if (in.read (edits.data() + start, (int) ((size_t) len * sizeof (float))) != (int) ((size_t) len * sizeof (float)))
+            return false;
+    }
+    const int nd = in.readInt();
+    if (nd < 0 || nd > 1000000) return false;
+    disabled.clear();
+    for (int k = 0; k < nd; ++k) { vx::RegionKey key; key.type = in.readInt(); key.startFrame = in.readInt(); disabled.push_back (key); }
+    const int nn = in.readInt();
+    if (nn < 0 || nn > 1000000) return false;
+    nodes.clear();
+    for (int k = 0; k < nn; ++k) { VXAudioModification::Node n; n.t = in.readDouble(); n.db = in.readFloat(); nodes.push_back (n); }
+    return true;
+}
+
+//==============================================================================
+static constexpr int kAnalysisMagic = 0x56584132;   // "VXA2" (valores quantizados + gzip)
+
+namespace
+{
+    // energia/pico em dB com passo de 0,01 dB em 16 bits
+    inline int16 encDb (float lin, bool power) noexcept
+    {
+        const float db = power ? 10.0f * std::log10 (lin + 1.0e-14f) : 20.0f * std::log10 (lin + 1.0e-9f);
+        return (int16) jlimit (-32000, 32000, roundToInt (db * 100.0f));
+    }
+    inline float decDb (int16 v, bool power) noexcept
+    {
+        const float db = (float) v * 0.01f;
+        return power ? std::pow (10.0f, db * 0.1f) : std::pow (10.0f, db * 0.05f);
+    }
+}
+
+MemoryBlock vxSerialiseAnalysis (const vx::Analysis& a)
+{
+    MemoryBlock block;
+    {
+        MemoryOutputStream mo (block, false);
+        GZIPCompressorOutputStream gz (mo, 9);
+        gz.writeInt (kAnalysisMagic);
+        gz.writeDouble (a.sampleRate);
+        gz.writeInt (a.hopSamples);
+        gz.writeInt64 (a.numSamples);
+        gz.writeInt (a.numChannels);
+        const int n = a.numFrames();
+        gz.writeInt (n);
+        const bool feat = (int) a.voicing.size() == n && (int) a.zcr.size() == n && (int) a.totMs.size() == n
+                       && (int) a.hfMs.size() == n && (int) a.sibFreq.size() == n;
+        gz.writeBool (feat);
+        // cada serie gravada inteira (comprime melhor do que intercalada)
+        for (int i = 0; i < n; ++i) gz.writeShort (encDb (a.ms[(size_t) i], true));
+        for (int i = 0; i < n; ++i) gz.writeShort (encDb (a.peak[(size_t) i], false));
+        if (feat)
+        {
+            for (int i = 0; i < n; ++i) gz.writeByte ((char) (uint8) jlimit (0, 255, roundToInt (a.voicing[(size_t) i] * 250.0f)));
+            for (int i = 0; i < n; ++i) gz.writeShort ((short) (uint16) jlimit (0, 65535, roundToInt (a.zcr[(size_t) i] * 0.25f)));
+            for (int i = 0; i < n; ++i) gz.writeShort (encDb (a.totMs[(size_t) i], true));
+            for (int i = 0; i < n; ++i) gz.writeShort (encDb (a.hfMs[(size_t) i], true));
+            for (int i = 0; i < n; ++i) gz.writeShort ((short) (uint16) jlimit (0, 65535, roundToInt (a.sibFreq[(size_t) i] * 0.02f)));
+        }
+        gz.flush();
+    }
+    return block;
+}
+
+std::shared_ptr<vx::Analysis> vxDeserialiseAnalysis (const void* data, size_t size)
+{
+    MemoryInputStream mi (data, size, false);
+    GZIPDecompressorInputStream gz (mi);
+    if (gz.readInt() != kAnalysisMagic) return nullptr;
+    auto a = std::make_shared<vx::Analysis>();
+    a->sampleRate  = gz.readDouble();
+    a->hopSamples  = gz.readInt();
+    a->numSamples  = gz.readInt64();
+    a->numChannels = gz.readInt();
+    const int n = gz.readInt();
+    if (n < 0 || n > 200000000 || a->hopSamples <= 0) return nullptr;
+    const bool feat = gz.readBool();
+
+    a->ms.resize ((size_t) n);   a->peak.resize ((size_t) n);
+    for (int i = 0; i < n; ++i) a->ms[(size_t) i]   = decDb ((int16) gz.readShort(), true);
+    for (int i = 0; i < n; ++i) a->peak[(size_t) i] = decDb ((int16) gz.readShort(), false);
+    if (feat)
+    {
+        for (auto* v : { &a->voicing, &a->zcr, &a->totMs, &a->hfMs, &a->sibFreq }) v->resize ((size_t) n);
+        for (int i = 0; i < n; ++i) a->voicing[(size_t) i] = (float) (uint8) gz.readByte() / 250.0f;
+        for (int i = 0; i < n; ++i) a->zcr[(size_t) i]     = (float) (uint16) gz.readShort() * 4.0f;
+        for (int i = 0; i < n; ++i) a->totMs[(size_t) i]   = decDb ((int16) gz.readShort(), true);
+        for (int i = 0; i < n; ++i) a->hfMs[(size_t) i]    = decDb ((int16) gz.readShort(), true);
+        for (int i = 0; i < n; ++i) a->sibFreq[(size_t) i] = (float) (uint16) gz.readShort() * 50.0f;
+    }
+    if (gz.isExhausted() && n > 0 && a->ms.empty()) return nullptr;
+    return a;
+}
+
 //==============================================================================
 VXAudioModification::VXAudioModification (ARAAudioSource* audioSource,
                                           ARA::ARAAudioModificationHostRef hostRef,
@@ -141,6 +308,7 @@ VXAudioModification::VXAudioModification (ARAAudioSource* audioSource,
     {
         editsDb = c->editsDb;
         disabledRegions = c->disabledRegions;
+        nodes = c->nodes;
     }
 }
 
@@ -466,29 +634,46 @@ static constexpr int kArchiveMagic = 0x56584c31;   // "VXL1"
 
 bool VXDocumentController::doStoreObjectsToStream (ARAOutputStream& output, const ARAStoreObjectsFilter* filter) noexcept
 {
+    // versao 4: [clipes: estado manual] + [fontes: analise compactada]
     const auto& mods = filter->getAudioModificationsToStore<VXAudioModification>();
+    const auto& sources = filter->getAudioSourcesToStore<VXAudioSource>();
+    auto* archiving = getDocumentController()->getHostArchivingController();
+    const float total = (float) jmax<size_t> (1, mods.size() + sources.size());
+    float done = 0.0f;
 
     if (! output.writeInt (kArchiveMagic)) return false;
-    if (! output.writeInt (2)) return false;   // versao
+    if (! output.writeInt (4)) return false;
+
     if (! output.writeInt64 ((int64) mods.size())) return false;
-
-    for (size_t i = 0; i < mods.size(); ++i)
+    for (auto* m : mods)
     {
-        auto* m = mods[i];
+        MemoryOutputStream state;
+        VXModState::from (*m).write (state);
         if (! output.writeString (String (m->getPersistentID()))) return false;
-
-        const bool any = m->hasEdits();
-        const int n = any ? (int) m->editsDb.size() : 0;
-        if (! output.writeInt (n)) return false;
-        if (n > 0 && ! output.write (m->editsDb.data(), (size_t) n * sizeof (float))) return false;
-
-        if (! output.writeInt ((int) m->disabledRegions.size())) return false;
-        for (auto& k : m->disabledRegions)
-            if (! output.writeInt (k.type) || ! output.writeInt (k.startFrame)) return false;
-
-        getDocumentController()->getHostArchivingController()->notifyDocumentArchivingProgress ((float) i / (float) jmax<size_t> (1, mods.size()));
+        if (! output.writeInt ((int) state.getDataSize())) return false;
+        if (state.getDataSize() > 0 && ! output.write (state.getData(), state.getDataSize())) return false;
+        archiving->notifyDocumentArchivingProgress (++done / total);
     }
-    getDocumentController()->getHostArchivingController()->notifyDocumentArchivingProgress (1.0f);
+
+    if (! output.writeInt64 ((int64) sources.size())) return false;
+    for (auto* src : sources)
+    {
+        if (! output.writeString (String (src->getPersistentID()))) return false;
+        auto analysis = src->getAnalysis();
+        if (analysis == nullptr || src->getState() != VXAudioSource::ready)
+        {
+            if (! output.writeInt (0)) return false;
+        }
+        else
+        {
+            const auto block = vxSerialiseAnalysis (*analysis);
+            if (! output.writeInt ((int) block.getSize())) return false;
+            if (! output.write (block.getData(), block.getSize())) return false;
+        }
+        archiving->notifyDocumentArchivingProgress (++done / total);
+    }
+
+    archiving->notifyDocumentArchivingProgress (1.0f);
     return true;
 }
 
@@ -497,43 +682,91 @@ bool VXDocumentController::doRestoreObjectsFromStream (ARAInputStream& input, co
     if (input.readInt() != kArchiveMagic) return ! input.failed();
     const int version = input.readInt();
     const auto count = input.readInt64();
+    auto* archiving = getDocumentController()->getHostArchivingController();
 
     for (int64 i = 0; i < count && ! input.failed(); ++i)
     {
         const String persistentID = input.readString();
-        const int n = input.readInt();
-        std::vector<float> edits;
-        if (n > 0 && n < 100000000)
-        {
-            edits.resize ((size_t) n);
-            if (input.read (edits.data(), (int) ((size_t) n * sizeof (float))) != (int) ((size_t) n * sizeof (float)))
-                return false;
-        }
+        VXModState st;
 
-        std::vector<vx::RegionKey> disabledKeys;
-        if (version >= 2)
+        if (version >= 4)
         {
-            const int nk = input.readInt();
-            for (int k = 0; k < nk && k < 1000000 && ! input.failed(); ++k)
+            const int size = input.readInt();
+            if (size < 0 || size > 400000000) return false;
+            MemoryBlock block ((size_t) size);
+            if (size > 0 && input.read (block.getData(), size) != size) return false;
+            MemoryInputStream mi (block, false);
+            if (size > 0 && ! st.read (mi)) continue;
+        }
+        else
+        {
+            // formatos antigos (1 a 3)
+            const int n = input.readInt();
+            if (n > 0 && n < 100000000)
             {
-                vx::RegionKey key;
-                key.type = input.readInt();
-                key.startFrame = input.readInt();
-                disabledKeys.push_back (key);
+                st.edits.resize ((size_t) n);
+                if (input.read (st.edits.data(), (int) ((size_t) n * sizeof (float))) != (int) ((size_t) n * sizeof (float)))
+                    return false;
+            }
+            if (version >= 2)
+            {
+                const int nk = input.readInt();
+                for (int k = 0; k < nk && k < 1000000 && ! input.failed(); ++k)
+                {
+                    vx::RegionKey key;
+                    key.type = input.readInt();
+                    key.startFrame = input.readInt();
+                    st.disabled.push_back (key);
+                }
+            }
+            if (version >= 3)
+            {
+                const int nn = input.readInt();
+                for (int k = 0; k < nn && k < 1000000 && ! input.failed(); ++k)
+                {
+                    VXAudioModification::Node nd;
+                    nd.t  = input.readDouble();
+                    nd.db = input.readFloat();
+                    st.nodes.push_back (nd);
+                }
             }
         }
 
         if (auto* m = filter->getAudioModificationToRestoreStateWithID<VXAudioModification> (persistentID.getCharPointer()))
         {
-            m->editsDb = std::move (edits);
-            m->disabledRegions = std::move (disabledKeys);
-            ++m->editsVersion;
-            ++m->regionsVersion;
+            st.applyTo (*m);
+            m->restoredFromArchive = true;
             m->notifyContentChanged (ARAContentUpdateScopes::samplesAreAffected(), false);
         }
-        getDocumentController()->getHostArchivingController()->notifyDocumentUnarchivingProgress ((float) i / (float) jmax<int64> (1, count));
+        archiving->notifyDocumentUnarchivingProgress (0.5f * (float) (i + 1) / (float) jmax<int64> (1, count));
     }
-    getDocumentController()->getHostArchivingController()->notifyDocumentUnarchivingProgress (1.0f);
+
+    if (version >= 4 && ! input.failed())
+    {
+        const auto nSources = input.readInt64();
+        for (int64 i = 0; i < nSources && ! input.failed(); ++i)
+        {
+            const String persistentID = input.readString();
+            const int size = input.readInt();
+            if (size < 0 || size > 400000000) return false;
+            if (size == 0) continue;
+            MemoryBlock block ((size_t) size);
+            if (input.read (block.getData(), size) != size) return false;
+
+            if (auto* src = filter->getAudioSourceToRestoreStateWithID<VXAudioSource> (persistentID.getCharPointer()))
+            {
+                auto a = vxDeserialiseAnalysis (block.getData(), block.getSize());
+                // so usa se o audio for o mesmo (tamanho, taxa e canais)
+                if (a != nullptr && a->numSamples == src->getSampleCount()
+                    && std::abs (a->sampleRate - src->getSampleRate()) < 0.5
+                    && a->numChannels == jlimit (1, 2, (int) src->getChannelCount()))
+                    src->setRestoredAnalysis (a);
+            }
+            archiving->notifyDocumentUnarchivingProgress (0.5f + 0.5f * (float) (i + 1) / (float) jmax<int64> (1, nSources));
+        }
+    }
+
+    archiving->notifyDocumentUnarchivingProgress (1.0f);
     return ! input.failed();
 }
 

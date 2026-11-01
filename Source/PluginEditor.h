@@ -36,6 +36,10 @@ public:
     void mouseDoubleClick (const juce::MouseEvent&) override;
     void mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails&) override;
 
+    enum class Tool { brush, nodes };
+    void setTool (Tool t);
+    Tool getTool() const noexcept { return tool; }
+
     void undo();
     void clearEdits();
     void fitView() { autoFit = true; repaint(); }
@@ -93,7 +97,19 @@ private:
     float hoverX = 0.0f;
 
     // edicao
-    struct Snapshot { VXAudioModification* mod; std::vector<float> edits; };
+    struct Snapshot { VXAudioModification* mod; std::vector<float> edits; std::vector<VXAudioModification::Node> nodes; };
+    void pushUndo (VXAudioModification* onlyThis = nullptr);
+
+    // ferramenta Nos
+    Tool tool = Tool::brush;
+    struct NodeHit { VXAudioModification* mod = nullptr; int index = -1; double playStart = 0, modStart = 0, modEnd = 0; };
+    NodeHit findNode (juce::Point<float> pos) const;
+    float nodeY (const Lane& lane, double srcT) const;
+    NodeHit hoverNode, dragNode;
+    double dragNodeStartT = 0.0;
+    float  dragNodeStartDb = 0.0f, dragStartX = 0.0f;
+    void mouseDownNodes (const juce::MouseEvent&);
+    void mouseDragNodes (const juce::MouseEvent&);
     std::vector<Snapshot> dragSnapshot;
     std::vector<std::vector<Snapshot>> undoStack;
     bool dragging = false;
@@ -115,6 +131,7 @@ public:
 
     void paint (juce::Graphics&) override;
     void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
 
 private:
     enum Section { gateSec = 0, dynSec, breathSec, sibSec, numSections };
@@ -152,7 +169,8 @@ private:
     std::vector<std::pair<juce::Component*, int>> sectionComps;
 
     juce::TextButton bypassButton { "Bypass" }, undoButton { "Undo" }, clearButton { "Clear Edits" },
-                     fitButton { "Fit" }, reanalyseButton { "Reanalisar" }, wavButton { "Export WAV" }, midiButton { "Export MIDI" };
+                     fitButton { "Fit" }, reanalyseButton { "Reanalisar" },
+                     brushButton { "Pincel" }, nodesButton { juce::String::fromUTF8 ("N\xc3\xb3s") }, wavButton { "Export WAV" }, midiButton { "Export MIDI" };
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> bypassAtt;
 
     std::unique_ptr<juce::FileChooser> chooser;

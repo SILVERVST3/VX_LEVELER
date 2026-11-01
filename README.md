@@ -45,12 +45,25 @@ Sem ARA (modo tempo real) só o Dynamics funciona.
 
 - Cinza claro = forma de onda original; azul-acinzentado = processada; linha azul-marinho = curva de ganho;
   tracejado = curva automática; laranja = suas edições manuais.
-- **Arraste para cima/baixo** sobre a forma de onda para subir/descer o ganho naquele trecho (Shift = ajuste fino).
+- Duas ferramentas na barra: **Pincel** (tecla B) e **Nós** (tecla N).
+- **Nós**: clique na curva para criar um ponto (ele nasce no valor atual, o som não muda) e arraste para cima/baixo
+  e para os lados (Shift = só vertical, ajuste fino). Entre os pontos o ajuste é linear; antes do primeiro e depois
+  do último vale o valor do ponto da ponta (como um envelope do REAPER) — para mexer só num trecho, crie um ponto
+  em cada borda e arraste o do meio. Apagar: Alt+clique, duplo clique ou botão direito. Ctrl+Z desfaz.
+- **Pincel: arraste para cima/baixo** sobre a forma de onda para subir/descer o ganho naquele trecho (Shift = ajuste fino).
 - **Shift + roda**: largura do pincel (faixa tracejada). **Ctrl + roda**: zoom. **Roda**: rolar. **Duplo clique**: enquadrar.
 - **Undo** / **Clear Edits**. As edições ficam salvas dentro do projeto do host (arquivo ARA).
 - **Export WAV**: grava a voz processada (24 bits) de cada clipe, com todas as seções.
 - **Reanalisar**: descarta a análise e lê o áudio de novo. O rodapé mostra um diagnóstico do ARA (clipes, fontes, acesso às amostras, análises).
 - **Export MIDI**: automação de volume em CC7 (canal 1, 120 BPM): -15 dB = 0, 0 dB = 63, +15 dB = 127.
+
+## O que fica salvo no projeto
+
+- A **análise** de cada áudio (compactada, ~1 KB por segundo de voz): ao reabrir o projeto o plugin não lê o áudio de novo,
+  a menos que o áudio tenha mudado (tamanho, taxa ou canais diferentes) ou você clique em **Reanalisar**.
+- As **edições manuais** (pincel, nós e regiões desligadas), no arquivo ARA do projeto **e** numa cópia de segurança dentro
+  do estado do plugin.
+- Toda edição marca o projeto como modificado no REAPER, então ele pede para salvar ao fechar.
 
 ## REAPER
 

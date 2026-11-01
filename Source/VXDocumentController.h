@@ -37,6 +37,8 @@ public:
     /** thread de mensagens */
     void startAnalysisIfNeeded();
     void invalidateAnalysis();
+    /** analise recuperada do projeto (nao precisa ler o audio de novo) */
+    void setRestoredAnalysis (std::shared_ptr<const vx::Analysis> a);
 
     std::shared_ptr<const vx::Analysis> getAnalysis() const   { return std::atomic_load (&analysis); }
     int   getAnalysisVersion() const noexcept                  { return analysisVersion.load(); }
@@ -71,6 +73,27 @@ public:
     std::vector<float> editsDb;
     int editsVersion = 0;
 
+    /** nos da ferramenta "Nos": envelope em dB (tempo da fonte, segundos), ordenado por tempo.
+        Entre nos: linear. Antes do primeiro / depois do ultimo: mantem o valor do no da ponta. */
+    struct Node { double t = 0.0; float db = 0.0f; };
+    std::vector<Node> nodes;
+
+    float nodeEnvAt (double t) const noexcept
+    {
+        if (nodes.empty()) return 0.0f;
+        if (t <= nodes.front().t) return nodes.front().db;
+        if (t >= nodes.back().t)  return nodes.back().db;
+        for (size_t i = 1; i < nodes.size(); ++i)
+            if (t < nodes[i].t)
+            {
+                const auto& a = nodes[i - 1];
+                const auto& b = nodes[i];
+                const double u = (t - a.t) / std::max (1.0e-9, b.t - a.t);
+                return (float) (a.db + (b.db - a.db) * u);
+            }
+        return nodes.back().db;
+    }
+
     /** regioes (pausa/respiro/sibilante) desligadas pelo usuario */
     std::vector<vx::RegionKey> disabledRegions;
     int regionsVersion = 0;
@@ -96,14 +119,36 @@ public:
     bool hasEdits() const
     {
         for (auto v : editsDb) if (std::abs (v) > 1.0e-6f) return true;
-        return false;
+        return ! nodes.empty();
     }
+
+    /** true quando o estado veio do arquivo ARA do projeto */
+    bool restoredFromArchive = false;
 
     /** avisa o host que o audio deste clipe mudou (apos uma edicao manual) */
     void notifyEdited();
 
     juce::String getDisplayName() const;
 };
+
+//==============================================================================
+/** Estado manual de um clipe (pincel, nos, regioes desligadas) - salvar/ler. */
+struct VXModState
+{
+    std::vector<float> edits;
+    std::vector<vx::RegionKey> disabled;
+    std::vector<VXAudioModification::Node> nodes;
+
+    static VXModState from (const VXAudioModification& m);
+    void applyTo (VXAudioModification& m) const;
+    bool isEmpty() const;
+    void write (juce::OutputStream& out) const;      // edicoes em trechos (so o que nao e zero)
+    bool read (juce::InputStream& in);
+};
+
+/** Analise <-> bytes compactados (gzip) */
+juce::MemoryBlock vxSerialiseAnalysis (const vx::Analysis& a);
+std::shared_ptr<vx::Analysis> vxDeserialiseAnalysis (const void* data, size_t size);
 
 //==============================================================================
 using VXCurveMap = std::unordered_map<const juce::ARAAudioModification*, std::shared_ptr<const vx::GainCurve>>;

@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_gui_basics/juce_gui_basics.h>
 #include "PluginEditor.h"
+#include "VXDocumentController.h"
 #include <cmath>
 #include <random>
 
@@ -76,6 +77,33 @@ int main (int argc, char** argv)
     const float* ch[1] = { x.data() };
     an.process (ch, 1, (int) x.size());
     std::shared_ptr<const vx::Analysis> analysis = an.finish();
+    {   // ROUNDTRIP: analise e estado manual
+        auto blk = vxSerialiseAnalysis (*analysis);
+        auto back = vxDeserialiseAnalysis (blk.getData(), blk.getSize());
+        // compara as curvas calculadas com a analise original e com a recuperada
+        bool same = false;
+        if (back != nullptr)
+        {
+            vx::Settings s0; s0.gateOn = true;
+            auto c1 = vx::computeGainCurve (*analysis, s0, nullptr);
+            auto c2 = vx::computeGainCurve (*back, s0, nullptr);
+            float maxDiff = 0.0f;
+            for (size_t i = 0; i < c1->gainDb.size(); ++i) maxDiff = std::max (maxDiff, std::abs (c1->gainDb[i] - c2->gainDb[i]));
+            printf ("diferenca maxima da curva apos salvar/ler: %.3f dB (regioes %zu vs %zu)\n", maxDiff, c1->regions.size(), c2->regions.size());
+            same = maxDiff < 0.1f && c1->regions.size() == c2->regions.size();
+        }
+        printf ("analise: %d quadros -> %d bytes gzip, ida e volta %s\n", analysis->numFrames(), (int) blk.getSize(), same ? "OK" : "FALHOU");
+        VXModState st;
+        st.edits.assign (1000, 0.0f); for (int i = 200; i < 260; ++i) st.edits[(size_t) i] = 2.5f;
+        st.disabled.push_back ({ 1, 345 });
+        st.nodes.push_back ({ 1.25, -3.0f }); st.nodes.push_back ({ 2.5, 4.0f });
+        juce::MemoryOutputStream mo; st.write (mo);
+        juce::MemoryInputStream mi (mo.getMemoryBlock(), true);
+        VXModState st2; const bool ok = st2.read (mi);
+        printf ("estado manual: %d bytes, ida e volta %s\n", (int) mo.getDataSize(),
+                ok && st2.edits == st.edits && st2.disabled.size() == 1 && st2.disabled[0].startFrame == 345
+                   && st2.nodes.size() == 2 && st2.nodes[1].db == 4.0f ? "OK" : "FALHOU");
+    }
     std::vector<float> edits ((size_t) analysis->numFrames(), 0.0f);
     for (int f = 820; f < 1000; ++f) edits[(size_t) f] = -4.0f * (float) std::sin (3.14159 * (f - 820) / 180.0);
     vx::Settings st;
@@ -94,6 +122,12 @@ int main (int argc, char** argv)
             v->previewLanes.push_back (d);
         }
     save (*ed, argc > 2 ? argv[2] : "snap_ara.png");
+
+    // NOS_TOOL: seleciona a ferramenta Nos
+    for (auto* c : ed->getChildren())
+        if (auto* b = dynamic_cast<juce::TextButton*> (c))
+            if (b->getButtonText() == juce::String::fromUTF8 ("N\xc3\xb3s")) { b->setToggleState (true, juce::dontSendNotification); b->onClick(); }
+    save (*ed, "/tmp/snap_nodes.png");
 
     // capturas das outras abas
     int idx = 0;
